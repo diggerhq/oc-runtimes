@@ -1,6 +1,6 @@
 {
   "name": "@oc/runtime-pi",
-  "version": "0.0.6",
+  "version": "0.0.7",
   "private": true,
   "type": "module",
   "description": "Durable Agent Sessions (v3) pi runtime image: the pi coding agent SDK (earendil-works/pi) wrapped as an OC brain behind the v3 runtime contract (design 011). Same adapter shape as v3-claude (per-turn OC-aware driver + resident OC-unaware brain server); the brain embeds createAgentSession, replaces pi's built-in tools with MCP-host-backed remotes (same names, extension path), and persists pi's JSONL session tree under OC_RUNTIME_STATE_DIR. provider=anthropic hardcoded for the S2 tracer. Standalone \u2014 its own deps and build, kept out of the root tsc.",
