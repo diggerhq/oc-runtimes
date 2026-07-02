@@ -1,25 +1,19 @@
 // The v3-codex ADAPTER — this runtime's RuntimeSpec on the shared adapter-core driver
-// (design 011 §5.3). Codex is the leanest consumer: no skills, no sources note, no watch
-// rendering (github.* input rendering unifies with claude's at the S3b renderer pass),
-// and the pre-drift MCP tool subset (the platform/GitHub tools were never in this brain's
+// (design 011 §5.3). Codex is the leanest consumer: no skills, no sources note, and the
+// pre-drift MCP tool subset (the platform/GitHub tools were never in this brain's
 // steering — exposing them without prompt support would be a behavior change; they arrive
-// deliberately, with steering, as their own canary).
+// deliberately, with steering, as their own canary). Input filtering/rendering is the
+// shared standard INCLUDING github.* watch deliveries: the watches API has no per-runtime
+// gate, so the old user.message-only filter silently ATE deliveries (review finding) —
+// a rendered notification any model can act on beats a consumed-and-lost wakeup.
 
-import { runAdapter, textOf, type InEvent, type TranslateCtx, type DurableEmitter } from "@oc/adapter-core";
+import { runAdapter, standardInputFilter, standardRenderInput, type TranslateCtx, type DurableEmitter } from "@oc/adapter-core";
 
 runAdapter({
   name: "codex",
   defaultModel: "openai/gpt-5-codex",
-
-  /** Human messages only. STRICT type match — `agent.message` (the agent's own answers
-   *  and asks) is ALSO user-level; a ".message"-suffix match would re-feed the agent its
-   *  own prior output as next-turn input. */
-  isInputForModel(e: InEvent): boolean {
-    return e.level === "user" && e.type === "user.message";
-  },
-  renderInput(e: InEvent): string {
-    return textOf(e.body);
-  },
+  isInputForModel: standardInputFilter,
+  renderInput: standardRenderInput,
 
   sourcesNote: () => "",
   skillsDir: () => null,   // skills unsupported on the codex family in v1 (009 §1)

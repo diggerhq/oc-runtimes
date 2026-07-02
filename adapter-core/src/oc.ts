@@ -54,14 +54,31 @@ const baseHeaders = { "X-Turn-Token": config.turnToken, "ngrok-skip-browser-warn
 const keyBase = Number(process.env.OC_EVENT_KEY_BASE ?? "0") || 0;
 let appendSeq = 0;
 
-export async function getEventsSince(afterSeq: number): Promise<InEvent[]> {
-  // level=internal → return ALL levels (the runtime needs every input event).
-  const r = await fetch(`${config.apiUrl}/v3/sessions/${config.sessionId}/events?after=${afterSeq}&level=internal`, {
-    headers: baseHeaders,
-  });
-  if (!r.ok) throw new Error(`getEvents ${r.status}: ${await r.text()}`);
-  const j = (await r.json()) as { data?: InEvent[] };
-  return j.data ?? [];
+/**
+ * Read the turn's input window, PAGINATED. The server caps a page at 100 (500 max) — and
+ * the window (cursor, input_to_seq] contains everything the PREVIOUS turn appended, so a
+ * single unpaginated fetch can fill page 1 with prior-turn output and never reach the
+ * triggering user.message (the host then advances the cursor and the message is silently
+ * lost — the F1-adjacent truncation class). Two defenses: request level=user (input events
+ * are all user-level — every spec's filter requires it — and this drops the tool/progress
+ * flood), and keep fetching until the page is exhausted or we've covered `upToSeq`.
+ */
+export async function getEventsSince(afterSeq: number, upToSeq = Infinity): Promise<InEvent[]> {
+  const out: InEvent[] = [];
+  let after = afterSeq;
+  for (;;) {
+    const r = await fetch(`${config.apiUrl}/v3/sessions/${config.sessionId}/events?after=${after}&level=user&limit=500`, {
+      headers: baseHeaders,
+    });
+    if (!r.ok) throw new Error(`getEvents ${r.status}: ${await r.text()}`);
+    const page = ((await r.json()) as { data?: InEvent[] }).data ?? [];
+    if (!page.length) return out;
+    out.push(...page);
+    const last = Number(page[page.length - 1].seq);
+    if (!Number.isFinite(last) || last <= after) return out; // defensive: never loop on a bad page
+    if (last >= upToSeq || page.length < 500) return out;
+    after = last;
+  }
 }
 
 export async function appendEvent(ev: OutEvent): Promise<void> {

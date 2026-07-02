@@ -26,15 +26,17 @@ hierarchy: design 011 (§11–§12).
 
 ## Source of truth & provenance
 
-Until the publish-pipeline home decision (011 O9, at S6), `sessions-api/runtimes/` is the
-pipeline's source of truth and this repo is its faithful mirror: content lands here ONLY
-via `scripts/sync-from-sessions-api.sh`, each sync commit stamped with the source sha.
-Directory names here drop the legacy `v3-` route prefixes; package names are
-`@oc/runtime-<name>`.
+**This repo IS the source of truth for runtime code** (O9 resolved 2026-07-02 — the move
+happened early, so every contract change crosses a real repo boundary). sessions-api
+contains host code only; its build pipeline (`scripts/build-runtime-snapshot.ts`) consumes
+a CLEAN checkout of this repo and stamps each build row's `source_ref` with
+`oc-runtimes@<sha>`.
 
-Snapshot builds run from sessions-api (`scripts/build-runtime-snapshot.ts`): fork-verify
-(brain boots + the adapter's module graph resolves in-image), publish-before-record, then
-an owner-pinned canary before any global pointer flip.
+Build flow per runtime: `npm install && npm run build` in `adapter-core/` then the runtime
+dir; the snapshot build fork-verifies (brain boots + the adapter's module graph resolves
+in-image), publishes before recording, then an owner-pinned canary runs before any global
+pointer flip. Dev loop: `adapter-core` is a `file:` dep of each runtime — rebuild it before
+typechecking consumers.
 
 ## pi
 

@@ -13,7 +13,8 @@
   },
   "scripts": {
     "build": "tsc",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "npx -y tsx test-skills-materialize.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",

@@ -36,6 +36,42 @@ export function textOf(body: unknown): string {
   return [b?.title, b?.text].filter(Boolean).join("\n") || "";
 }
 
+/** Render a watch delivery (github.pr.*, design 010 §13) as a readable notification for the model
+ *  — a concise, normalized summary (never the raw webhook), so the agent knows what happened and
+ *  can react (or fetch more). Shared by every runtime: the watches API has no per-runtime gate, so
+ *  a spec that drops github.* input EATS deliveries silently (hit in review on codex). */
+export function renderWatchEvent(type: string, body: any): string {
+  const pr = body?.pr, url = body?.url;
+  const head = `[PR #${pr} event] `;
+  const why = body?.intent ? `\nYou are watching this PR to: ${body.intent}` : "";
+  const msg = (() => {
+    switch (type) {
+      case "github.pr.comment":
+        return `${head}New comment${body?.author ? ` by @${body.author}` : ""}:\n${body?.comment ?? ""}\n${body?.comment_url ?? url ?? ""}`;
+      case "github.pr.checks_completed":
+        return `${head}Checks ${body?.state}${Array.isArray(body?.failing) && body.failing.length ? ` — failing: ${body.failing.map((f: any) => f.name).join(", ")}` : ""}.\n${url ?? ""}`;
+      case "github.pr.review_submitted":
+        return `${head}A review was submitted${body?.by ? ` by @${body.by}` : ""}${body?.changes_requested ? " (changes requested)" : body?.approved ? " (approved)" : ""}.\n${url ?? ""}`;
+      case "github.pr.merged": return `${head}The PR was merged.\n${url ?? ""}`;
+      case "github.pr.closed": return `${head}The PR was closed.\n${url ?? ""}`;
+      default: return `${head}${type}\n${url ?? ""}`;
+    }
+  })();
+  return msg + why;
+}
+
+/** The standard input filter: human messages + watch deliveries. STRICT type allowlist —
+ *  `agent.message` (the agent's own answers/asks) is ALSO user-level, so a suffix match
+ *  would re-feed the agent its own prior output as next-turn input. */
+export function standardInputFilter(e: InEvent): boolean {
+  return e.level === "user" && typeof e.type === "string" && (e.type === "user.message" || e.type.startsWith("github."));
+}
+
+/** The standard input renderer: watch deliveries via renderWatchEvent, else textOf. */
+export function standardRenderInput(e: InEvent): string {
+  return typeof e.type === "string" && e.type.startsWith("github.") ? renderWatchEvent(e.type, e.body) : textOf(e.body);
+}
+
 /** Passed to spec.translate alongside each native step. */
 export interface TranslateCtx {
   /** The effective model id (OC_MODEL ?? spec.defaultModel), for agent.result bodies. */
@@ -75,9 +111,10 @@ export function runAdapter(spec: RuntimeSpec): void {
   const turnId = config.turnId;
   const cursor = Number(process.env.OC_EVENTS_CURSOR ?? "0");
   // Upper bound of THIS turn's input window (pinned at accept). Events past it belong to the
-  // NEXT turn — their wakeup re-fires, so consuming them here would deliver them twice. 0/absent
-  // (an older host) → unbounded, today's behavior.
-  const inputToSeq = Number(process.env.OC_INPUT_TO_SEQ ?? "0") || 0;
+  // NEXT turn — their wakeup re-fires, so consuming them here would deliver them twice.
+  // Absent/unparseable (an older host) → Infinity, i.e. unbounded — the single sentinel keeps
+  // the consumer a plain `seq <= inputToSeq` with no zero-special-case to forget.
+  const inputToSeq = Number(process.env.OC_INPUT_TO_SEQ ?? "") || Infinity;
   const agentPrompt = process.env.OC_AGENT_PROMPT ?? "You are a helpful background agent.";
   const model = process.env.OC_MODEL ?? spec.defaultModel;
   // Managed model access (token-billing §5.2): non-secret routing the host derived
@@ -276,10 +313,11 @@ export function runAdapter(spec: RuntimeSpec): void {
     if (flushed) console.error(`[adapter] recovered ${flushed} spooled step(s) from a prior attempt`);
 
     // Input: the new user messages at the cursor (the brain's own resume carries history),
-    // bounded above by the turn's pinned input window.
-    const inputs: InEvent[] = await getEventsSince(cursor);
+    // bounded above by the turn's pinned input window. The read PAGINATES to the bound —
+    // the window also contains the previous turn's output volume (see getEventsSince).
+    const inputs: InEvent[] = await getEventsSince(cursor, inputToSeq);
     const prompt = inputs
-      .filter((e) => inputToSeq === 0 || Number(e.seq) <= inputToSeq)
+      .filter((e) => Number(e.seq) <= inputToSeq)
       .filter((e) => spec.isInputForModel(e))
       .map((e) => spec.renderInput(e))
       .join("\n\n") || "(no new input)";
