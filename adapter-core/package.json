@@ -1,0 +1,27 @@
+{
+  "name": "@oc/adapter-core",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "The OC-aware per-turn adapter core shared by all Durable Agent Sessions runtimes (design 011 \u00a75.3): durable event spool + idempotent append (fenced), resident-brain supervision, the localhost MCP tool host, skills materialization, and the turn driver that streams a brain's native NDJSON through a per-runtime translate(). Runtimes contribute a RuntimeSpec (model default, input filter/renderer, translate, steering text, skills layout, tool subset) and nothing else.",
+  "main": "dist/index.js",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^4.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "typescript": "^5"
+  },
+  "types": "dist/index.d.ts"
+}

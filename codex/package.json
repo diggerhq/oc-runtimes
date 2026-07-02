@@ -1,0 +1,25 @@
+{
+  "name": "@oc/runtime-codex",
+  "version": "0.0.8",
+  "private": true,
+  "type": "module",
+  "description": "Durable Agent Sessions (v3) codex runtime image: a reshaped brain web-server wrapping the OpenAI Codex SDK (server.ts) + the platform-provided OC-aware adapter (adapter.ts, the per-turn entrypoint turn.ts execs). Tools via an adapter-hosted MCP endpoint; resume via a persisted server-side thread id under OC_RUNTIME_STATE_DIR. Standalone \u2014 its own deps + build, kept out of the root tsc.",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/adapter.js",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@openai/codex-sdk": "^0.142.0",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^4.0.0",
+    "@oc/adapter-core": "file:../adapter-core"
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "typescript": "^5"
+  },
+  "bin": {
+    "oc-runtime-codex": "dist/adapter.js"
+  }
+}
