@@ -156,23 +156,32 @@ function profileError(msg: string): never {
   throw new Error(`flue profile violation: ${msg}`);
 }
 
-/** Once-per-process: stores → R4 stamp → wrapped agent → coordinator → runtime seed. */
-export async function ensureEngine(userAgent: AgentDefinitionLike, turn: TurnRequest): Promise<EngineHandles> {
-  if (engine) return engine;
-  const stateDir = turn.config.state_dir ?? process.env.OC_RUNTIME_STATE_DIR ?? "/tmp/oc-flue-state";
-  const state = new PackageState(stateDir);
+// The current turn's model/deadline — read by the wrapped agent's initialize at RUN time (flue
+// calls initialize per submission during execution, shortly after admit). attachTurn sets this
+// before each admit; turns are host-serialized + admits are chained, so a running submission
+// reads its own turn's values. Model is box-invariant (deploy-pinned) so a stale read can't
+// diverge; the deadline is refreshed per turn (fixes R5's baked-once timeout).
+let currentTurnConfig: { model?: string; deadlineS: number } = { deadlineS: 1800 };
 
-  // Provider registration from endpoint_profile: managed → explicit base URL + sealed env
-  // key; BYO → env key, transport rides the proxy bootstrap. Turn config is box-invariant.
-  const profile = turn.config.endpoint_profile;
-  const authEnv = profile?.auth_env ?? "ANTHROPIC_API_KEY";
-  const apiKey = process.env[authEnv];
-  if (apiKey || profile?.base_url) {
-    registerProvider("anthropic", {
-      ...(profile?.base_url ? { baseUrl: profile.base_url } : {}),
-      ...(apiKey ? { apiKey } : {}),
-    } as never);
+function timeoutMsFromDeadline(deadlineS: number): number {
+  return Math.max(60_000, (deadlineS - 15) * 1000);
+}
+
+/** Structural profile validation (policy-free, profile_version-scoped): sandbox unset, no
+ *  reserved tool names, model shape. Shared by the wrapped agent and the eager boot validate. */
+function assertProfile(cfg: Record<string, unknown>): void {
+  if (cfg.sandbox != null) profileError("`sandbox` must be unset — OpenComputer supplies the session sandbox");
+  const tools = Array.isArray(cfg.tools) ? (cfg.tools as Array<{ name?: string }>) : [];
+  for (const t of tools) {
+    if (t?.name && RESERVED_TOOL_NAMES.has(t.name)) profileError(`custom tool name '${t.name}' is reserved`);
   }
+}
+
+/** Build the store + coordinator once per process. No turn needed — the wrapped agent reads
+ *  currentTurnConfig at run time, the provider is registered per turn. Idempotent. */
+async function buildEngine(userAgent: AgentDefinitionLike, stateDir: string): Promise<EngineHandles> {
+  if (engine) return engine;
+  const state = new PackageState(stateDir);
 
   const adapter = sqlite(join(stateDir, "flue.db"));
   if (adapter.migrate) await adapter.migrate();
@@ -182,44 +191,31 @@ export async function ensureEngine(userAgent: AgentDefinitionLike, turn: TurnReq
   };
   const submissions = stores.executionStore.submissions;
 
-  // §11.9 R4 — reconcile to quiescence BEFORE any admit (the claim loop that starts with
-  // the first admission reclaims expired leases and RESUMES continuable work). Fast path,
-  // S0a-measured ~100ms vs the 30s lease wait: directly fail each stale running row.
-  for (const row of await submissions.listRunningSubmissions()) {
-    const attemptId = row.attempt?.attemptId ?? row.attemptId;
-    if (!attemptId) continue;
-    await submissions.failSubmission({ submissionId: row.submissionId, attemptId }, new Error("stale run settled at boot (R4)"));
-    staleRunsSettledAtBoot++;
-  }
-
-  // R5 — durability is per-agent config in flue: apply by WRAPPING the user's definition.
-  // Profile checks here are STRUCTURAL, scoped by profile_version (the policy-free rule).
-  const deadlineS = turn.config.deadline_s ?? (Number(process.env.OC_TURN_DEADLINE_S ?? "") || 1800);
-  const timeoutMs = Math.max(60_000, (deadlineS - 15) * 1000);
   let coordinatorRef: Coordinator | null = null;
   const ocTools = createOcTools({
     state,
     abortCurrentInstance: async () => (coordinatorRef ? coordinatorRef.abortInstance(AGENT_NAME, INSTANCE_ID) : false),
   });
+  // R5 — durability is per-agent config in flue: applied by WRAPPING the user's definition,
+  // reading the CURRENT turn's model/deadline (not a boot-time snapshot). Checks are STRUCTURAL.
   const wrapped: AgentDefinitionLike = {
     __flueAgentDefinition: true,
     initialize: async (ctx: unknown) => {
       const cfg = (await userAgent.initialize(ctx)) as Record<string, unknown>;
-      if (cfg.sandbox != null) profileError("`sandbox` must be unset — OpenComputer supplies the session sandbox");
-      const tools = Array.isArray(cfg.tools) ? (cfg.tools as Array<{ name?: string }>) : [];
-      for (const t of tools) {
-        if (t?.name && RESERVED_TOOL_NAMES.has(t.name)) profileError(`custom tool name '${t.name}' is reserved`);
-      }
+      assertProfile(cfg);
       return {
         ...cfg,
         // deploy-time triangle made divergence impossible; the host string wins (managed slugs)
-        model: turn.config.model ?? cfg.model,
-        durability: { maxAttempts: 1, timeoutMs },
+        model: currentTurnConfig.model ?? cfg.model,
+        durability: { maxAttempts: 1, timeoutMs: timeoutMsFromDeadline(currentTurnConfig.deadlineS) },
         sandbox: ocSandbox(),
-        tools: [...tools, ...ocTools],
+        tools: [...tools(cfg), ...ocTools],
       };
     },
   };
+  function tools(cfg: Record<string, unknown>): Array<{ name?: string }> {
+    return Array.isArray(cfg.tools) ? (cfg.tools as Array<{ name?: string }>) : [];
+  }
 
   const activityGate = createRuntimeActivityGate();
   const agents = [{ name: AGENT_NAME, definition: wrapped }];
@@ -251,6 +247,76 @@ export async function ensureEngine(userAgent: AgentDefinitionLike, turn: TurnReq
 
   engine = { state, coordinator, submissions };
   return engine;
+}
+
+/** §11.9 R4 — reconcile EVERY unsettled submission to terminal at boot; never auto-resume.
+ *  Running rows: direct failSubmission (fast, terminal; maxAttempts=1 blocks resume). Queued/
+ *  terminalizing rows survive that (failSubmission is gated status='running') and would wedge a
+ *  re-attach FOREVER (finding 4 — the claim loop never starts on a pure re-attach). abortInstance
+ *  stamps abort_requested_at + drives the claim loop, which settles a queued row aborted WITHOUT
+ *  running it (Q5) and reconcile finalizes terminalizing rows. Returns the count settled. */
+async function reconcileToQuiescence(eng: EngineHandles): Promise<number> {
+  let settled = 0;
+  for (const row of await eng.submissions.listRunningSubmissions()) {
+    const attemptId = row.attempt?.attemptId ?? row.attemptId;
+    if (!attemptId) continue;
+    await eng.submissions.failSubmission({ submissionId: row.submissionId, attemptId }, new Error("stale run settled at boot (R4)"));
+    settled++;
+  }
+  if (await eng.submissions.hasUnsettledSubmissions()) {
+    settled += (await listUnsettled(eng.submissions)).length;
+    await eng.coordinator.abortInstance(AGENT_NAME, INSTANCE_ID);
+    const deadline = Date.now() + R4_QUIESCE_TIMEOUT_MS;
+    while ((await eng.submissions.hasUnsettledSubmissions()) && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+  }
+  return settled;
+}
+
+const R4_QUIESCE_TIMEOUT_MS = Number(process.env.OC_R4_QUIESCE_TIMEOUT_MS ?? "") || 10_000;
+
+/** Eager boot (finding 7): build the engine + VALIDATE the agent (initialize + profile — a
+ *  throwing initialize or a broken sqlite fails HERE, not the paying user's first turn) + run
+ *  R4 to quiescence. serveOC gates /healthz `ready` on this resolving. Provider registration +
+ *  the turn's model/deadline stay per-turn (they need the /turn config) — §11.4/§11.7.7 as-built.
+ *  Throws on any validation/boot failure. */
+export async function bootConfigure(userAgent: AgentDefinitionLike, stateDir?: string): Promise<void> {
+  const dir = stateDir ?? process.env.OC_RUNTIME_STATE_DIR ?? "/tmp/oc-flue-state";
+  const eng = await buildEngine(userAgent, dir);
+  // Validate the user's agent once at boot: initialize must not throw; profile must hold; the
+  // model must be anthropic-shaped. This is what the deploy-verify /healthz probe now proves.
+  const cfg = (await userAgent.initialize({ id: "boot-validate", env: process.env })) as Record<string, unknown>;
+  assertProfile(cfg);
+  if (!cfg.model || !/^anthropic\//.test(String(cfg.model))) {
+    profileError(`model must be 'anthropic/<id>' (the agent declares '${String(cfg.model)}')`);
+  }
+  staleRunsSettledAtBoot += await reconcileToQuiescence(eng);
+}
+
+/** Per-turn: ensure the engine is built (fallback if bootConfigure was skipped), set the turn's
+ *  model/deadline for the wrapped agent, register the provider from the endpoint profile. */
+export async function ensureEngine(userAgent: AgentDefinitionLike, turn: TurnRequest): Promise<EngineHandles> {
+  const stateDir = turn.config.state_dir ?? process.env.OC_RUNTIME_STATE_DIR ?? "/tmp/oc-flue-state";
+  const eng = await buildEngine(userAgent, stateDir);
+
+  currentTurnConfig = {
+    model: turn.config.model,
+    deadlineS: turn.config.deadline_s ?? (Number(process.env.OC_TURN_DEADLINE_S ?? "") || 1800),
+  };
+
+  // Provider registration from endpoint_profile: managed → explicit base URL + sealed env key;
+  // BYO → env key, transport rides the proxy bootstrap. Idempotent; safe to repeat per turn.
+  const profile = turn.config.endpoint_profile;
+  const authEnv = profile?.auth_env ?? "ANTHROPIC_API_KEY";
+  const apiKey = process.env[authEnv];
+  if (apiKey || profile?.base_url) {
+    registerProvider("anthropic", {
+      ...(profile?.base_url ? { baseUrl: profile.base_url } : {}),
+      ...(apiKey ? { apiKey } : {}),
+    } as never);
+  }
+  return eng;
 }
 
 export interface AttachResult {

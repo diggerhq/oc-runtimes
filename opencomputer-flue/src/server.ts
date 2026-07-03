@@ -8,7 +8,7 @@ import { createServer, type ServerResponse } from "node:http";
 import { installProxyFetch } from "./proxy.js";
 import { activeTurn, mcpPing } from "./mcp-client.js";
 import {
-  attachTurn, engineBusy, OrphanWedgedError,
+  attachTurn, bootConfigure, engineBusy, OrphanWedgedError,
   type AgentDefinitionLike, type TurnRequest, type ForwardedEvent,
 } from "./flue-glue.js";
 
@@ -72,12 +72,30 @@ export function serveOC(agent: AgentDefinitionLike): void {
   let activeStream: symbol | null = null;
   let seq = 0;
 
+  // Eager configure (finding 7): build the engine, VALIDATE the agent (initialize + profile),
+  // run R4 — before /healthz reports ready. The deploy-verify probe waits for ready, so a
+  // bundle whose initialize() throws or whose sqlite init breaks now fails VERIFY, not the
+  // paying user's first turn. Provider/model stay per-turn (§11.4/§11.7.7 as-built).
+  let bootState: "starting" | "ready" | { error: string } = "starting";
+  void bootConfigure(agent).then(
+    () => { bootState = "ready"; },
+    (err: unknown) => {
+      const message = err instanceof Error ? err.message : String(err);
+      bootState = { error: message };
+      process.stderr.write(`[opencomputer-flue] boot configure failed: ${message}\n`);
+    },
+  );
+
   const srv = createServer((req, res) => {
     void (async () => {
       if (req.method === "GET" && req.url?.startsWith("/healthz")) {
-        const busy = activeStream !== null || (await engineBusy());
+        const status = bootState === "starting" ? "starting" : bootState === "ready" ? "ready" : "error";
+        const busy = status === "ready" && (activeStream !== null || (await engineBusy()));
         res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify({ status: "ready", contract_version: CONTRACT_VERSION, busy }));
+        res.end(JSON.stringify({
+          status, contract_version: CONTRACT_VERSION, busy,
+          ...(typeof bootState === "object" ? { detail: bootState.error } : {}),
+        }));
         return;
       }
       if (req.method !== "POST" || !req.url?.startsWith("/turn")) {
@@ -88,6 +106,12 @@ export function serveOC(agent: AgentDefinitionLike): void {
       if (activeStream !== null) {
         res.writeHead(409, { "content-type": "application/json" });
         res.end(JSON.stringify({ error: { type: "busy", message: "a turn is already streaming" } }));
+        return;
+      }
+      if (typeof bootState === "object") {
+        // eager configure failed — the agent never validated; fail every turn loudly.
+        res.writeHead(503, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: { type: "not_configured", message: bootState.error } }));
         return;
       }
 
