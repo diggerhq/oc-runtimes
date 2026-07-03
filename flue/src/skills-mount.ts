@@ -20,11 +20,11 @@
 //   - Marker-guarded (artifact digest + source set): rebuild only on a fresh hands box or a
 //     change. Idempotent per box.
 //
-// W2a: this is called by the flue adapter path in the driver (adapter-core), AFTER hands
-// ensure and BEFORE POST /turn, wired against the frozen sandbox surface below. The driver
-// already has a per-tool proxy (mcp-host.ts:sandboxCall) — the coordinator injects a
-// HandsSandbox backed by it (the same POST /v3/sessions/:id/sandbox/{op} endpoints), NOT the
-// MCP tools, so no tool.call/exec.completed events are emitted.
+// Wiring: the flue RuntimeSpec's prepareWorkspace hook (adapter.ts) calls this. The driver
+// (adapter-core) runs prepareWorkspace AFTER the brain/hands are up and the artifact is
+// materialized, BEFORE POST /turn, and injects a HandsProxy backed by mcp-host's exported
+// sandboxCall — the raw POST /v3/sessions/:id/sandbox/{op} path, NOT the MCP tools, so no
+// tool.call/exec.completed events are emitted.
 
 import { createHash } from "node:crypto";
 import { readdirSync, readFileSync, existsSync } from "node:fs";

@@ -14,7 +14,7 @@
     "build": "tsc",
     "start": "node dist/adapter.js",
     "typecheck": "tsc --noEmit",
-    "test": "npx -y tsx test/translate.test.ts && npx -y tsx test/skills-mount.test.ts && npx -y tsx test/launcher.test.ts"
+    "test": "npx -y tsx test/translate.test.ts && npx -y tsx test/skills-mount.test.ts && npx -y tsx test/launcher.test.ts && npx -y tsx test/cursor.test.ts && npx -y tsx test/fixture-smoke.test.ts"
   },
   "dependencies": {
     "@oc/adapter-core": "file:../adapter-core"

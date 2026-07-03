@@ -16,17 +16,12 @@
 //   - sourcesNote: repos are checked out under /workspace/sources/<name>; v0 flue agents have
 //     NO github_publish_pull_request tool, so the note does not reference it (contrast pi).
 
-import { runAdapter, standardInputFilter, standardRenderInput, type RuntimeSpec } from "@oc/adapter-core";
+import { runAdapter, standardInputFilter, standardRenderInput, type RuntimeSpec, type WorkspacePrep } from "@oc/adapter-core";
+import { join } from "node:path";
 import { translateFlueEvent } from "./translate.js";
+import { buildSkillsMount, computeMountMarker } from "./skills-mount.js";
 
-// W2a: `busyPolicy` is not yet on adapter-core's RuntimeSpec (contract 13). Declare it here
-// so the flue spec is authored against the frozen contract; the coordinator adds the field +
-// its ensureBrain behavior to adapter-core/src/driver.ts. Passing extra props to
-// runAdapter() is harmless at runtime (ignored until the driver reads it); typing the spec
-// as a superset keeps this compile-clean without a cast.
-type FlueRuntimeSpec = RuntimeSpec & { busyPolicy?: "kill" | "reattach" };
-
-const spec: FlueRuntimeSpec = {
+const spec: RuntimeSpec = {
   name: "flue",
   defaultModel: "anthropic/claude-sonnet-5",
 
@@ -55,8 +50,22 @@ const spec: FlueRuntimeSpec = {
 
   translate: translateFlueEvent,
 
-  // W2a (contract 13): admit-and-detach ⇒ do not reap a ready+busy brain at turn start.
+  // Admit-and-detach ⇒ do not reap a ready+busy brain at turn start; the brain's R3 attach
+  // protocol governs (012 §11.9, contract 13).
   busyPolicy: "reattach",
+
+  // The aggregated skills mount (contracts 16+17): after brain/hands up + artifact materialized,
+  // before /turn. The driver hands us an EVENT-FREE hands proxy + the parsed sources + the
+  // artifact digest; buildSkillsMount writes /workspace/.agents/skills from the artifact's
+  // skills + each source's .agents/skills (app wins), marker-guarded, never into sources/<repo>.
+  async prepareWorkspace(w: WorkspacePrep): Promise<void> {
+    await buildSkillsMount({
+      artifactSkillsDir: join(w.stateDir, "artifact", "skills"),
+      sources: w.sources,
+      sandbox: w.sandbox,
+      markerValue: computeMountMarker(w.artifactDigest, w.sources.map((s) => s.name)),
+    });
+  },
 };
 
 runAdapter(spec);

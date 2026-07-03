@@ -24,7 +24,7 @@ import { openSync, closeSync, unlinkSync, existsSync, writeFileSync, readFileSyn
 import { join, dirname } from "node:path";
 import { config, getEventsSince, type InEvent } from "./oc.js";
 import { DurableEmitter } from "./emitter.js";
-import { startMcpHost, type HostContext } from "./mcp-host.js";
+import { startMcpHost, sandboxCall, type HostContext } from "./mcp-host.js";
 import { materializeBundle, emptySkills } from "./skills.js";
 
 export type { InEvent } from "./oc.js";
@@ -80,9 +80,31 @@ export interface TranslateCtx {
   noteAssistantText(text: string): void;
 }
 
+/** An EVENT-FREE hands proxy (design 012 §11.6 e2): direct sandbox ops that do NOT append OC
+ *  events, for workspace preparation outside the model's tool loop. Backed by mcp-host's
+ *  sandboxCall; return shapes are the raw sandbox responses ({error} on failure). */
+export interface HandsProxy {
+  exec(command: string): Promise<any>;
+  write(path: string, content: string): Promise<any>;
+  read(path: string): Promise<any>;
+}
+
+/** Context handed to RuntimeSpec.prepareWorkspace, run after the brain/hands are up and the
+ *  artifact is materialized, before POST /turn. Generic; only flue uses it (skills mount). */
+export interface WorkspacePrep {
+  /** The per-session runtime state dir (materialized artifact lives at `<stateDir>/artifact`). */
+  stateDir: string;
+  /** Attached sources parsed from OC_SOURCES ([] if none). */
+  sources: Array<{ name: string; repo: string; ref: string }>;
+  /** The pinned framework artifact digest (OC_FRAMEWORK_ARTIFACT_DIGEST), "" if none. */
+  artifactDigest: string;
+  /** Event-free hands access (no tool.call/exec.completed emitted). */
+  sandbox: HandsProxy;
+}
+
 /** The whole per-runtime surface. Everything else is the shared driver. */
 export interface RuntimeSpec {
-  /** Runtime name for logs ("claude" | "codex" | "pi"). */
+  /** Runtime name for logs ("claude" | "codex" | "pi" | "flue"). */
   name: string;
   defaultModel: string;
   /** True for a user-facing INPUT event the model should see this turn. STRICT type
@@ -97,6 +119,14 @@ export interface RuntimeSpec {
   skillsDir(stateDir: string): string | null;
   /** MCP host tool subset; undefined = the full set. */
   mcpTools?: string[];
+  /** How ensureBrain treats a ready+BUSY brain at turn start (012 §11.9, contract 13):
+   *  "kill" (default) reaps it as an orphan; "reattach" leaves it — for admit-and-detach
+   *  engines (flue) a busy brain is a run in flight the brain's R3 attach protocol handles. */
+  busyPolicy?: "kill" | "reattach";
+  /** Optional per-turn workspace preparation (after brain/hands up + artifact materialized,
+   *  before /turn). flue uses it for the aggregated skills mount (contracts 16+17). A throw
+   *  fails the turn (error.runtime{code:"workspace_prepare"}). */
+  prepareWorkspace?(w: WorkspacePrep): Promise<void>;
 }
 
 const BRAIN_START_DEADLINE_MS = 30_000;
@@ -131,6 +161,12 @@ export function runAdapter(spec: RuntimeSpec): void {
   const skillBundleDigest = process.env.OC_SKILL_BUNDLE_DIGEST ?? "";
   const skillsDir = spec.skillsDir(stateDir);
   const skillsRoot = process.env.OC_SKILLS_ROOT ?? "";
+  // Framework runtimes (design 012 §11): a user-built artifact materialized like a skill bundle.
+  const frameworkArtifactDigest = process.env.OC_FRAMEWORK_ARTIFACT_DIGEST ?? "";
+  // Attempt counter + turn deadline (012 §11.9 R5/R6, contract 7) — sent on /turn for ALL
+  // runtimes; only brains that read them (flue) change behavior. attempt defaults to 1.
+  const turnAttempt = Number(process.env.OC_TURN_ATTEMPT ?? "1") || 1;
+  const turnDeadlineS = Number(process.env.OC_TURN_DEADLINE_S ?? "") || undefined;
 
   // The brain is baked BESIDE the consuming adapter's entry (dist/server.js) — resolve it
   // from the PROCESS entry (dist/adapter.js), not from this module (which lives in the
@@ -185,6 +221,15 @@ export function runAdapter(spec: RuntimeSpec): void {
     const st = await brainStatus();
     if (st.up && !st.busy) return;
     if (st.up && st.busy) {
+      // busyPolicy "reattach" (012 §11.9 / contract 13): an admit-and-detach engine (flue) keeps
+      // running a submission after the /turn socket closed, so a busy brain at turn start is a run
+      // IN FLIGHT, not an orphan. Leave it — the brain's R3 attach protocol re-attaches/drains/
+      // orphan-aborts (with its own ORPHAN_ABORT_TIMEOUT → killBrain escape). Reaping here would
+      // remove that. Default "kill": turns are fence-serialized, so a busy brain is always stale.
+      if (spec.busyPolicy === "reattach") {
+        console.error("[adapter] brain busy at turn start — busyPolicy=reattach, leaving it for the R3 attach protocol");
+        return;
+      }
       console.error("[adapter] brain busy at turn start (orphaned prior turn) — killing + restarting");
       killBrain();
       await sleep(300);   // let the listen port free before respawn
@@ -303,6 +348,40 @@ export function runAdapter(spec: RuntimeSpec): void {
     return changed;
   }
 
+  /**
+   * Materialize the session's pinned FRAMEWORK ARTIFACT (design 012 §11.5/§11.6) — the exact
+   * skill-bundle mechanism reused verbatim (same tar.gz + fileset digest, materializeBundle),
+   * with the artifact's own paths (contract 6): versioned unpack under
+   * `<stateDir>/artifact-versions/<digest>/`, atomic symlink `<stateDir>/artifact` → it; the
+   * launcher reads `<stateDir>/artifact/artifact.json`. Two-step signed-URL fetch (contract 2)
+   * so the turn token never reaches R2; materializeBundle re-verifies the fileset digest.
+   * Returns true when the live target CHANGED (caller restarts the resident brain). No-op for
+   * runtimes without OC_FRAMEWORK_ARTIFACT_DIGEST. Throws → the caller fails the turn.
+   */
+  async function materializeArtifact(): Promise<boolean> {
+    if (!frameworkArtifactDigest) return false; // not a framework runtime — no-op
+    const artifactRoot = join(stateDir, "artifact-versions");
+    const artifactDir = join(stateDir, "artifact");
+    mkdirSync(artifactRoot, { recursive: true });
+    const cacheFile = join(stateDir, "artifact.digest");
+    const cached = existsSync(cacheFile) ? readFileSync(cacheFile, "utf8").trim() : "";
+    if (cached === frameworkArtifactDigest && existsSync(artifactDir)) return false; // warm cache hit
+
+    // Two steps so the turn token never reaches R2 (contract 2, mirrors skill-bundle): (1) ask
+    // the control plane (X-Turn-Token) for a short-lived signed URL — it verifies the digest
+    // against the session snapshot; (2) download from that URL with NO auth header.
+    const metaUrl = `${config.apiUrl}/v3/sessions/${config.sessionId}/framework-artifact?digest=${encodeURIComponent(frameworkArtifactDigest)}&mode=url`;
+    const meta = await fetch(metaUrl, { headers: { "X-Turn-Token": config.turnToken } });
+    if (!meta.ok) throw new Error(`framework-artifact ${meta.status}: ${await meta.text().catch(() => "")}`);
+    const { url } = (await meta.json()) as { url: string };
+    const r = await fetch(url); // NO headers — never send the turn token to R2
+    if (!r.ok) throw new Error(`framework-artifact download ${r.status}`);
+    const tarGz = Buffer.from(await r.arrayBuffer());
+    const { changed } = materializeBundle({ tarGz, expectedDigest: frameworkArtifactDigest, skillsRoot: artifactRoot, skillsDir: artifactDir });
+    writeFileSync(cacheFile, frameworkArtifactDigest);
+    return changed;
+  }
+
   // ── Main ─────────────────────────────────────────────────────────────────────
 
   async function main(): Promise<void> {
@@ -335,6 +414,19 @@ export function runAdapter(spec: RuntimeSpec): void {
       process.exit(1);
     }
 
+    // Framework artifact (012 §11.5/§11.6) — materialize BEFORE the brain starts (the launcher
+    // reads `<stateDir>/artifact/artifact.json`) and before prepareWorkspace (skills mount reads
+    // the artifact's skills). No-op unless OC_FRAMEWORK_ARTIFACT_DIGEST is set.
+    try {
+      const artifactChanged = await materializeArtifact();
+      if (artifactChanged) killBrain(); // a resident brain must restart to load the new artifact
+    } catch (err) {
+      await em.emit({ type: "error.runtime", level: "internal", body: { code: "artifact_materialize", retriable: false, message: err instanceof Error ? err.message : String(err) } }).catch(() => {});
+      await em.drain().catch(() => {});
+      console.error("[adapter] artifact materialize failed — failing turn:", err);
+      process.exit(1);
+    }
+
     const ctx: HostContext = { sawUserFacing: false, awaitingInput: false };
     const host = await startMcpHost(em, ctx, mcpPort, spec.mcpTools);
 
@@ -347,6 +439,34 @@ export function runAdapter(spec: RuntimeSpec): void {
     try {
       await ensureBrain();
 
+      // Per-runtime workspace prep (after brain/hands up + artifact materialized, before /turn).
+      // flue builds the aggregated skills mount here via an EVENT-FREE hands proxy (012 §11.6 e2).
+      // A failure fails the turn with a distinct code (mirrors skills_materialize).
+      if (spec.prepareWorkspace) {
+        try {
+          await spec.prepareWorkspace({
+            stateDir,
+            sources: parseSources(),
+            artifactDigest: frameworkArtifactDigest,
+            sandbox: {
+              exec: (command: string) => sandboxCall("exec", { command }),
+              write: (path: string, content: string) => sandboxCall("write", { path, content }),
+              read: (path: string) => sandboxCall("read", { path }),
+            },
+          });
+        } catch (err) {
+          await em.emit({ type: "error.runtime", level: "internal", body: { code: "workspace_prepare", retriable: false, message: err instanceof Error ? err.message : String(err) } }).catch(() => {});
+          await em.drain().catch(() => {});
+          await host.close().catch(() => {});
+          console.error("[adapter] workspace prepare failed — failing turn:", err);
+          process.exit(1);
+        }
+      }
+
+      // Offset cursor (012 §11.9 R6, contract 12): resume the brain's stream where our durable OC
+      // appends stopped, so a re-attaching attempt replays gap events once and never re-appends.
+      const eventsFromOffset = readOffsetCursor(stateDir, turnId);
+
       const resume = existsSync(join(stateDir, "journal"));
       const res = await fetch(`http://127.0.0.1:${brainPort}/turn`, {
         method: "POST",
@@ -355,8 +475,13 @@ export function runAdapter(spec: RuntimeSpec): void {
         body: JSON.stringify({
           contract_version: "1",
           turn_id: turnId,
+          // attempt + events_from_offset are TOP-LEVEL body fields (serveOC reads them there,
+          // 012 §11.9 R3/R6); deadline_s rides config. All additive — brains that ignore them
+          // are unaffected (contract 7).
+          attempt: turnAttempt,
+          ...(eventsFromOffset !== undefined ? { events_from_offset: eventsFromOffset } : {}),
           input: [{ role: "user", content: prompt }],
-          config: { model, system_prompt: `${agentPrompt}${spec.sourcesNote()}`, mcp_endpoint: host.url, state_dir: stateDir, resume, max_turns: 24, endpoint_profile: endpointProfile },
+          config: { model, system_prompt: `${agentPrompt}${spec.sourcesNote()}`, mcp_endpoint: host.url, state_dir: stateDir, resume, max_turns: 24, endpoint_profile: endpointProfile, ...(turnDeadlineS !== undefined ? { deadline_s: turnDeadlineS } : {}) },
         }),
       });
       if (!res.ok || !res.body) throw new Error(`brain /turn ${res.status}: ${await res.text().catch(() => "")}`);
@@ -370,6 +495,10 @@ export function runAdapter(spec: RuntimeSpec): void {
           if (err instanceof Error && err.message === "fenced") { fenced = true; break; }
           throw err;
         }
+        // R6: persist the cursor AFTER the step's events are durably appended — a re-attach then
+        // resumes exactly here. Only steps that carry an offset (flue's `{seq,kind,offset,msg}`)
+        // advance it; runtimes without offsets are unaffected.
+        if (typeof step?.offset === "number") writeOffsetCursor(stateDir, turnId, step.offset);
       }
     } catch (err) {
       if (err instanceof Error && err.message === "fenced") fenced = true;
@@ -429,6 +558,7 @@ export function runAdapter(spec: RuntimeSpec): void {
     }
 
     if (terminalReason === "quiescent" || terminalReason === "awaiting_input") {
+      clearOffsetCursor(stateDir, turnId);          // clean terminal: no re-attach will need it (contract 12)
       process.exit(0);                              // needs_input is read from the ask event, not the code
     }
     // error reason, or the stream ended with no done line (brain crash) → non-zero so the
@@ -480,3 +610,40 @@ export function runAdapter(spec: RuntimeSpec): void {
 function safeUnlink(p: string): void { try { if (existsSync(p)) unlinkSync(p); } catch { /* ignore */ } }
 function sleep(ms: number): Promise<void> { return new Promise((r) => setTimeout(r, ms)); }
 function nowPlus(ms: number): number { return Date.now() + ms; }
+
+/** Attached sources from OC_SOURCES ([] on absent/malformed). Shared shape with sourcesNote. */
+function parseSources(): Array<{ name: string; repo: string; ref: string }> {
+  try {
+    const s = JSON.parse(process.env.OC_SOURCES ?? "[]");
+    return Array.isArray(s) ? s : [];
+  } catch {
+    return [];
+  }
+}
+
+// Offset cursor (012 §11.9 R6, contract 12): `<stateDir>/spool/turn-<T>.flue-offset`, the flue
+// stream offset up to which this attempt's events are durably appended. Read at turn start,
+// sent as events_from_offset; written after each successful append; deleted on clean terminal.
+function offsetCursorPath(stateDir: string, turnId: string): string {
+  return join(stateDir, "spool", `turn-${turnId}.flue-offset`);
+}
+export function readOffsetCursor(stateDir: string, turnId: string): number | undefined {
+  try {
+    const n = Number(readFileSync(offsetCursorPath(stateDir, turnId), "utf8").trim());
+    return Number.isFinite(n) ? n : undefined;
+  } catch {
+    return undefined;
+  }
+}
+export function writeOffsetCursor(stateDir: string, turnId: string, offset: number): void {
+  try {
+    const p = offsetCursorPath(stateDir, turnId);
+    mkdirSync(dirname(p), { recursive: true });
+    writeFileSync(p, String(offset));
+  } catch {
+    // best-effort: on failure a re-attach just resumes from the last persisted cursor
+  }
+}
+export function clearOffsetCursor(stateDir: string, turnId: string): void {
+  safeUnlink(offsetCursorPath(stateDir, turnId));
+}
