@@ -39,7 +39,10 @@ export interface HostContext {
 
 // Proxy a tool to the remote hands box (NEVER local exec). Mirrors oc-tools.ts: probe;
 // a 404 means the hands endpoints aren't live yet → a clear coming-soon error.
-async function sandboxCall(op: string, body: unknown): Promise<any> {
+// Exported so the driver can build an EVENT-FREE hands proxy for RuntimeSpec.prepareWorkspace
+// (the flue skills mount writes to hands directly, without emitting tool.call/exec.completed —
+// 012 §11.6 e2). Tool handlers still layer emitter.emit around this; the raw call is silent.
+export async function sandboxCall(op: string, body: unknown): Promise<any> {
   try {
     const r = await fetch(`${config.apiUrl}/v3/sessions/${config.sessionId}/sandbox/${op}`, {
       method: "POST",

@@ -1,0 +1,8 @@
+{
+  "entry": "oc.js",
+  "profile_version": 1,
+  "model": "anthropic/claude-sonnet-5",
+  "flue_version": "0.0.0-fixture",
+  "oc_flue_version": "0.0.1",
+  "node_range": ">=22.19"
+}
