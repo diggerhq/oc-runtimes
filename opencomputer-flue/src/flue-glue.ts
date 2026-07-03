@@ -13,7 +13,7 @@ import {
   createNodeAgentCoordinator, createNodeDispatchQueue, createRuntimeActivityGate,
   configureFlueRuntime, resolveModel,
 } from "@flue/runtime/internal";
-import { PackageState } from "./state.js";
+import { PackageState, type OutcomeRecord } from "./state.js";
 import { ocSandbox } from "./sandbox.js";
 import { createOcTools, RESERVED_TOOL_NAMES } from "./tools.js";
 
@@ -102,12 +102,45 @@ export const AGENT_NAME = "oc";
 export const INSTANCE_ID = "session";
 
 let engine: EngineHandles | null = null;
-// Per-submission live event buffers. Process memory is legitimate here: the brain is
-// resident, and every non-resident recovery path goes through R4 fresh-run (012 §11.9).
+// Per-submission live event buffers — a same-process fast path for replay. The DURABLE
+// backstop for every cross-process path is `state` (turn-map, awaiting flag, outcomes.json):
+// a fresh brain over a recreated box has empty Maps and must not rely on them (finding 2).
 const buffers = new Map<string, ForwardedEvent[]>();
-const outcomes = new Map<string, { failed: boolean; error?: string }>();
+const outcomes = new Map<string, OutcomeRecord>();
 // R4 boot-reconcile count, surfaced on the FIRST done line after boot then cleared.
 let staleRunsSettledAtBoot = 0;
+
+/** The settle outcome for a submission: in-memory fast path (same process) ∪ the durable
+ *  record (finding 2 — the only source in a fresh process; getSubmission can't tell
+ *  completed from aborted from failed). */
+function classifyOutcome(state: PackageState, submissionId: string): OutcomeRecord | null {
+  return outcomes.get(submissionId) ?? state.getOutcome(submissionId);
+}
+
+/** The run's final assistant text, scanned back-to-front from its forwarded-event buffer.
+ *  Persisted with the outcome so a fresh-process drain can still deliver the answer. */
+function extractAnswerText(buf: ForwardedEvent[]): string | undefined {
+  for (let i = buf.length - 1; i >= 0; i--) {
+    if (buf[i].type !== "message_end") continue;
+    const message = (buf[i] as { message?: { role?: string; content?: unknown } }).message;
+    if (!message || message.role !== "assistant" || !Array.isArray(message.content)) continue;
+    const text = (message.content as Array<{ type?: string; text?: string }>)
+      .filter((b) => b?.type === "text" && typeof b.text === "string" && b.text.trim())
+      .map((b) => b.text).join("");
+    if (text.trim()) return text;
+  }
+  return undefined;
+}
+
+/** Every non-settled submission (running ∪ runnable ∪ unready). The R3/R4 paths reason over
+ *  this set; flue exposes it only as three status-scoped lists, so we union them. */
+async function listUnsettled(submissions: Submissions): Promise<SubmissionRow[]> {
+  return (await Promise.all([
+    submissions.listRunningSubmissions(),
+    submissions.listRunnableSubmissions(),
+    submissions.listUnreadySubmissions(),
+  ])).flat();
+}
 
 /** R2 — /healthz busy is ENGINE truth: any non-settled submission. */
 export async function engineBusy(): Promise<boolean> {
@@ -267,15 +300,17 @@ async function attachTurnSerialized(userAgent: AgentDefinitionLike, turn: TurnRe
     if (sub && sub.status === "settled") {
       const drained: TurnDisposition = { attach_mode: "drain_settled", ...takeStaleRunsSettled() };
       if (eng.state.consumeAwaiting(turn.turn_id)) {
-        return drainSettled(prior.submissionId, fromOffset, "awaiting_input", undefined, drained);
+        return drainSettled(eng, prior.submissionId, fromOffset, "awaiting_input", undefined, drained);
       }
-      const out = outcomes.get(prior.submissionId);
-      if (out && !out.failed) return drainSettled(prior.submissionId, fromOffset, "quiescent", undefined, drained);
-      if (out && out.failed && out.error && !/abort/i.test(out.error)) {
-        return drainSettled(prior.submissionId, fromOffset, "error", out.error, drained);
+      const out = classifyOutcome(eng.state, prior.submissionId);
+      if (out?.outcome === "completed") return drainSettled(eng, prior.submissionId, fromOffset, "quiescent", undefined, drained);
+      if (out?.outcome === "failed" && out.error && !/abort/i.test(out.error)) {
+        return drainSettled(eng, prior.submissionId, fromOffset, "error", out.error, drained);
       }
-      // settled-aborted (or outcome unknown from a previous life), no flag → fresh re-run:
-      // the honest claude/pi semantic, bounded duplicated-progress cost.
+      // settled-aborted (no awaiting flag) OR no durable outcome (crashed in the settle→record
+      // window) → fresh re-run: the honest claude/pi semantic, bounded duplicated-progress cost.
+      // A durably-COMPLETED run never reaches here (classifyOutcome reads it cross-process),
+      // so box recreation no longer double-runs a finished turn.
     }
   }
 
@@ -285,7 +320,12 @@ async function attachTurnSerialized(userAgent: AgentDefinitionLike, turn: TurnRe
   const orphan = await abortOrphans(eng, turn.turn_id);
 
   const submissionId = await freshAdmit(eng, key, turn);
-  return followSubmission(eng, submissionId, fromOffset, turn, {
+  // A FRESH submission's `eventIndex` restarts at 0 (flue resets it per submission — no
+  // initialEventIndex on the node admit path). The adapter's `events_from_offset` cursor
+  // belonged to the DEAD attempt's submission; honoring it here would filter out the new
+  // run's events 0..cursor — the head of the answer, silently (finding 3). A fresh re-run
+  // re-emits from the start; the adapter re-appends (accepted duplicated-progress semantic).
+  return followSubmission(eng, submissionId, -1, turn, {
     attach_mode: "fresh",
     ...(orphan ? { orphan_abort: orphan } : {}),
     ...takeStaleRunsSettled(),
@@ -300,23 +340,16 @@ const ORPHAN_ABORT_TIMEOUT_MS = Number(process.env.OC_ORPHAN_ABORT_TIMEOUT_MS ??
  *  @flue/runtime processSubmission). A run that ignores its abort signal keeps the engine
  *  wedged → OrphanWedgedError → serveOC dies (killBrain fallback) → next boot R4-reconciles. */
 async function abortOrphans(eng: EngineHandles, turnId: string): Promise<{ aborted: number; waited_ms: number } | null> {
-  const listUnsettled = async (): Promise<SubmissionRow[]> =>
-    (await Promise.all([
-      eng.submissions.listRunningSubmissions(),
-      eng.submissions.listRunnableSubmissions(),
-      eng.submissions.listUnreadySubmissions(),
-    ])).flat();
-
   // Unmapped unsettled rows count as orphans too: a crash between admit and turn-map record
   // leaves one, and admitting a SECOND concurrent run of the same input is strictly worse.
-  const orphans = (await listUnsettled()).filter((s) => eng.state.turnForSubmission(s.submissionId) !== turnId);
+  const orphans = (await listUnsettled(eng.submissions)).filter((s) => eng.state.turnForSubmission(s.submissionId) !== turnId);
   if (orphans.length === 0) return null;
   const ids = new Set(orphans.map((s) => s.submissionId));
 
   const started = Date.now();
   await eng.coordinator.abortInstance(AGENT_NAME, INSTANCE_ID);
   for (;;) {
-    const stillUnsettled = (await listUnsettled()).filter((s) => ids.has(s.submissionId));
+    const stillUnsettled = (await listUnsettled(eng.submissions)).filter((s) => ids.has(s.submissionId));
     if (stillUnsettled.length === 0) break;
     if (Date.now() - started > ORPHAN_ABORT_TIMEOUT_MS) {
       throw new OrphanWedgedError(stillUnsettled.length, Date.now() - started);
@@ -331,13 +364,7 @@ async function abortOrphans(eng: EngineHandles, turnId: string): Promise<{ abort
  *  our admit is ours. The mapping is recorded as soon as the id is known. */
 async function freshAdmit(eng: EngineHandles, key: string, turn: TurnRequest): Promise<string> {
   const message = turn.input.map((m) => m.content).join("\n\n");
-  const before = new Set(
-    (await Promise.all([
-      eng.submissions.listRunningSubmissions(),
-      eng.submissions.listRunnableSubmissions(),
-      eng.submissions.listUnreadySubmissions(),
-    ])).flat().map((s) => s.submissionId),
-  );
+  const before = new Set((await listUnsettled(eng.submissions)).map((s) => s.submissionId));
 
   const admission = eng.coordinator.createAdmission(AGENT_NAME, INSTANCE_ID);
   const pending: ForwardedEvent[] = [];
@@ -347,11 +374,7 @@ async function freshAdmit(eng: EngineHandles, key: string, turn: TurnRequest): P
   // correlate the id
   let submissionId: string | null = null;
   for (let i = 0; i < 200 && !submissionId; i++) {
-    const all = (await Promise.all([
-      eng.submissions.listRunningSubmissions(),
-      eng.submissions.listRunnableSubmissions(),
-      eng.submissions.listUnreadySubmissions(),
-    ])).flat();
+    const all = await listUnsettled(eng.submissions);
     const fresh = all.filter((s) => !before.has(s.submissionId));
     if (fresh.length > 0) submissionId = fresh[fresh.length - 1].submissionId;
     else await new Promise((r) => setTimeout(r, 25));
@@ -364,19 +387,41 @@ async function freshAdmit(eng: EngineHandles, key: string, turn: TurnRequest): P
   }
   eng.state.recordSubmission(key, submissionId);
   buffers.set(submissionId, pending);
+  const sid = submissionId;
+  const settle = (rec: OutcomeRecord): void => {
+    outcomes.set(sid, rec);
+    eng.state.recordOutcome(sid, rec); // durable — a fresh process reads THIS, not the Map
+  };
   void completion.then(
-    () => outcomes.set(submissionId as string, { failed: false }),
-    (err: unknown) => outcomes.set(submissionId as string, { failed: true, error: err instanceof Error ? err.message : String(err) }),
+    () => settle({ outcome: "completed", answerText: extractAnswerText(pending) }),
+    (err: unknown) => {
+      // flue serializes every abort (incl. our ask self-abort) to SubmissionAbortedError with a
+      // fixed "aborted" message (verified in dist); a non-abort message is a real failure.
+      const msg = err instanceof Error ? err.message : String(err);
+      settle(/abort/i.test(msg) ? { outcome: "aborted" } : { outcome: "failed", error: msg });
+    },
   );
   return submissionId;
 }
 
-/** Drain an already-settled run's buffered tail — no re-run, no model spend. */
-function drainSettled(submissionId: string, fromOffset: number, reason: DoneReason, error: string | undefined, disposition: TurnDisposition): AttachResult {
+/** Drain an already-settled run — no re-run, no model spend. Same process: replay the buffered
+ *  tail past the cursor. Fresh process (buffer died with the old brain): the forwarded events
+ *  aren't durably replayable (flue keeps no per-submission event stream — finding 2/Q4), so
+ *  recover the final answer from the durable outcome as a synthetic message_end. */
+function drainSettled(eng: EngineHandles, submissionId: string, fromOffset: number, reason: DoneReason, error: string | undefined, disposition: TurnDisposition): AttachResult {
   const buf = buffers.get(submissionId) ?? [];
   async function* gen(): AsyncGenerator<ForwardedEvent> {
-    for (const ev of buf) {
-      if ((ev.eventIndex ?? Number.MAX_SAFE_INTEGER) > fromOffset) yield ev;
+    if (buf.length > 0) {
+      for (const ev of buf) {
+        if ((ev.eventIndex ?? Number.MAX_SAFE_INTEGER) > fromOffset) yield ev;
+      }
+      return;
+    }
+    if (reason === "quiescent") {
+      const out = eng.state.getOutcome(submissionId);
+      if (out?.answerText) {
+        yield { type: "message_end", eventIndex: 0, message: { role: "assistant", content: [{ type: "text", text: out.answerText }] } };
+      }
     }
   }
   return { events: gen(), done: Promise.resolve({ reason, ...(error ? { error } : {}) }), disposition };
@@ -398,8 +443,14 @@ function followSubmission(eng: EngineHandles, submissionId: string, fromOffset: 
     // A detached subscriber's done line is never written — leave the awaiting flag for the
     // re-attaching attempt that WILL deliver it (the reported reason here is discarded).
     if (isLive() && eng.state.consumeAwaiting(turn.turn_id)) return { reason: "awaiting_input" };
-    const out = outcomes.get(submissionId);
-    if (out?.failed && out.error && !/abort/i.test(out.error)) return { reason: "error", error: out.error };
+    // getSubmission-settled races the settle callback that records the outcome; poll briefly so
+    // a failed run reports `error`, not a defaulted `quiescent`.
+    let out = classifyOutcome(eng.state, submissionId);
+    for (let i = 0; i < 20 && !out; i++) {
+      await new Promise((r) => setTimeout(r, 25));
+      out = classifyOutcome(eng.state, submissionId);
+    }
+    if (out?.outcome === "failed" && out.error && !/abort/i.test(out.error)) return { reason: "error", error: out.error };
     return { reason: "quiescent" };
   })();
 
