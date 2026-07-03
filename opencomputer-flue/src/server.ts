@@ -24,8 +24,15 @@ interface DescribeOutput {
 async function describe(agent: AgentDefinitionLike): Promise<DescribeOutput> {
   const cfg = (await agent.initialize({ id: "describe", env: process.env })) as {
     model?: string;
+    sandbox?: unknown;
     tools?: Array<{ name?: string }>;
   };
+  // Profile check at BUILD time (012 §11.2.3): the docs promise a sandbox: setting fails the
+  // deploy, so --describe must reject it — the runtime check in flue-glue alone would let the
+  // violation ride to the first turn.
+  if (cfg.sandbox != null) {
+    throw new Error("`sandbox` must be unset — OpenComputer supplies the session sandbox (remove sandbox: from your agent definition)");
+  }
   return {
     model: cfg.model ?? null,
     profile_version: PROFILE_VERSION,

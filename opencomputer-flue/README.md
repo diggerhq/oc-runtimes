@@ -1,6 +1,6 @@
 # @opencomputer/flue
 
-Run a [Flue](https://flue.build) agent as an OpenComputer Durable Agent
+Run a [Flue](https://flueframework.com) agent as an OpenComputer Durable Agent
 Session. Your agent code stays plain Flue; this package supplies the entry
 that connects it to the platform, and a build command that produces the
 deployable artifact.

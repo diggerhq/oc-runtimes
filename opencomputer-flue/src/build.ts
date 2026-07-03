@@ -35,6 +35,17 @@ function findEntry(root: string, explicit?: string): string {
   fail(`no entry found — expected one of: ${ENTRY_CANDIDATES.join(", ")} (see docs: agent-sessions/flue)`);
 }
 
+/** A `db.ts` configures a second Flue store — on OpenComputer the conversation lives in the
+ *  session's state volume, and a second store would fork the history. Rejected at build (the
+ *  docs promise this; silently ignoring it would mislead worse than failing). */
+function rejectDbConfig(root: string): void {
+  for (const candidate of [".flue/db.ts", "src/db.ts", "db.ts"]) {
+    if (existsSync(join(root, candidate))) {
+      fail(`${candidate} found — OpenComputer supplies conversation persistence; a second store would fork the history. Remove it (it can live on a non-OC branch of your app).`);
+    }
+  }
+}
+
 /** Packaged skill imports are a build error in profile v1 (012 §11.13). */
 function rejectPackagedSkillImports(root: string): void {
   const srcRoot = existsSync(join(root, "src")) ? join(root, "src") : root;
@@ -62,6 +73,7 @@ async function main(): Promise<void> {
   const root = process.cwd();
   const outDir = join(root, "dist-oc");
   const entry = findEntry(root, entryFlag);
+  rejectDbConfig(root);
   rejectPackagedSkillImports(root);
 
   rmSync(outDir, { recursive: true, force: true });
