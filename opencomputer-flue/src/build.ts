@@ -71,6 +71,26 @@ async function main(): Promise<void> {
     `const require = __ocCreateRequire(import.meta.url);`,
   ].join("\n");
 
+  // just-bash's OPTIONAL compression backends: node-liblzma (unresolvable optional dep) and
+  // @mongodb-js/zstd (a NATIVE .node addon — never portable inside a cross-platform bundle).
+  // Both are reached only via lazy import() in try/catch (verified), and only by flue's
+  // in-memory bash, which OpenComputer replaces with the workspace sandbox. Stub them with
+  // modules that throw on evaluation — the dynamic import rejects and just-bash degrades.
+  const STUBBED = ["node-liblzma", "@mongodb-js/zstd"];
+  const stubPlugin = {
+    name: "oc-stub-optional-natives",
+    setup(b: { onResolve: Function; onLoad: Function }) {
+      b.onResolve({ filter: new RegExp(`^(${STUBBED.map((x) => x.replace(/[/@-]/g, "\\$&")).join("|")})$`) }, (args: { path: string }) => ({
+        path: args.path,
+        namespace: "oc-stub",
+      }));
+      b.onLoad({ filter: /.*/, namespace: "oc-stub" }, (args: { path: string }) => ({
+        contents: `throw new Error(${JSON.stringify(`${args.path} is stubbed out of the OpenComputer bundle (optional just-bash compression backend)`)});`,
+        loader: "js",
+      }));
+    },
+  };
+
   await build({
     entryPoints: [entry],
     outfile: join(outDir, "oc.js"),
@@ -79,6 +99,7 @@ async function main(): Promise<void> {
     format: "esm",
     target: "node22",
     banner: { js: banner },
+    plugins: [stubPlugin as never],
     logLevel: "warning",
   });
 
@@ -107,8 +128,11 @@ async function main(): Promise<void> {
   const appRequire = createRequire(join(root, "package.json"));
   let flueVersion = "unknown";
   try {
-    flueVersion = (appRequire("@flue/runtime/package.json") as { version: string }).version;
-  } catch { /* lockfile-less installs — recorded as unknown, deploy still validates the triangle */ }
+    // their exports map hides package.json — resolve the entry, then read the package root
+    const entryPath = appRequire.resolve("@flue/runtime");
+    const pkgDir = entryPath.slice(0, entryPath.lastIndexOf("/node_modules/@flue/runtime/") + "/node_modules/@flue/runtime".length);
+    flueVersion = (JSON.parse(readFileSync(join(pkgDir, "package.json"), "utf8")) as { version: string }).version;
+  } catch { /* recorded as unknown; deploy still validates the triangle */ }
   const self = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { version: string };
 
   const manifest = {
