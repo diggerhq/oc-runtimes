@@ -5,19 +5,26 @@
 // port. This file NEVER links @flue/runtime; it only reads artifact.json and import()s the
 // self-contained bundle, so it launches whichever conformant artifact was materialized.
 //
-// Boot semantics:
-//   - SPAWNED (node dist/server.js): bootFlueBrain() runs; any failure → distinct message +
-//     non-zero exit fast (the driver's start-deadline turns it into a turn error; in practice
-//     deploy-time verification, 012 §11.7.7, makes a missing artifact unreachable in prod).
-//   - IMPORTED (no auto-run): the module only defines exports. The fork-verify variant
-//     (build-runtime-snapshot.ts, ARTIFACT_HOSTED, §11.7.5 / W3.5) imports this file and
-//     calls bootFlueBrain() against an image with NO artifact, asserting it rejects with
-//     ArtifactMissingError — proof the launcher runs and fails the RIGHT way, without a real
-//     brain boot. The main-module guard below is what keeps import side-effect-free.
+// Boot semantics — boot runs at MODULE TOP LEVEL, so both SPAWN and IMPORT trigger it. This
+// is required by contract 18 (flue-slice.md, frozen by PR #57): the missing-artifact failure
+// must surface ON IMPORT of dist/server.js against an empty state dir, with an error string
+// matching /artifact/i — the snapshot fork-verify probe (build-runtime-snapshot.ts,
+// ARTIFACT_HOSTED, §11.7.5 / W3.5) does `import(dist/server.js)` and matches that token; it
+// does NOT spawn. So a main-module guard (side-effect-free import) would defeat the probe.
+//   - SPAWNED (node dist/server.js, the driver's brain): top-level bootFlueBrain() resolves
+//     the artifact and imports its entry, which calls serveOC() and binds the port. A failure
+//     rejects the top-level await → node prints the error and exits non-zero fast (the
+//     driver's start-deadline turns it into a turn error; deploy-time verification, §11.7.7,
+//     makes a missing artifact unreachable in prod).
+//   - IMPORTED (the fork-verify probe): the same top-level boot runs. Against an image with NO
+//     artifact it throws ArtifactMissingError (message contains "artifact"), so `import()`
+//     REJECTS with it — proof the launcher ran and failed the right way, no real brain boot.
+// bootFlueBrain + ArtifactMissingError stay exported for callers that prefer to invoke
+// explicitly; the top-level call is what satisfies contract 18's import-triggers-failure rule.
 
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { pathToFileURL, fileURLToPath } from "node:url";
+import { pathToFileURL } from "node:url";
 
 /** Thrown when the artifact (or its entry) is absent — the fork-verify sentinel (W3.5). */
 export class ArtifactMissingError extends Error {
@@ -75,15 +82,14 @@ export async function bootFlueBrain(): Promise<void> {
   await import(pathToFileURL(entryPath).href);
 }
 
-// Main-module guard: run only when spawned directly, so `import()` stays side-effect-free
-// for the fork-verify probe. (NodeNext ESM: no require.main; compare argv[1] to this file.)
-const invokedDirectly = process.argv[1] != null && process.argv[1] === fileURLToPath(import.meta.url);
-
-if (invokedDirectly) {
-  bootFlueBrain().catch((err: unknown) => {
-    const name = err instanceof Error ? err.name : "Error";
-    const message = err instanceof Error ? err.message : String(err);
-    console.error(`[flue-launcher] ${name}: ${message}`);
-    process.exit(1);
-  });
-}
+// Top-level boot (contract 18): both spawn and import trigger it. On failure we log a labeled
+// line, then RE-THROW so the rejection propagates to the top-level await — which makes
+// `import(server.js)` reject (the fork-verify probe reads that) AND makes a spawned process
+// exit non-zero. We deliberately do NOT process.exit() in a swallowing .catch(): that would
+// resolve the import and hide the failure from the probe.
+await bootFlueBrain().catch((err: unknown) => {
+  const name = err instanceof Error ? err.name : "Error";
+  const message = err instanceof Error ? err.message : String(err);
+  console.error(`[flue-launcher] ${name}: ${message}`);
+  throw err;
+});
