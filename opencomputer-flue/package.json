@@ -1,0 +1,42 @@
+{
+  "name": "@opencomputer/flue",
+  "version": "0.1.0",
+  "description": "Run a Flue agent as an OpenComputer durable session — serveOC(agent) is the session's resident brain",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=22.19"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "bin": {
+    "oc-flue-build": "dist/build.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run"
+  },
+  "peerDependencies": {
+    "@flue/runtime": "^1.0.0-beta.9"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "esbuild": "^0.25.0",
+    "undici": "^7.3.0"
+  },
+  "devDependencies": {
+    "@flue/runtime": "1.0.0-beta.9",
+    "@types/node": "^22.10.0",
+    "typescript": "^5.9.3",
+    "valibot": "^1.1.0",
+    "vitest": "^3.0.0"
+  }
+}

@@ -1,0 +1,326 @@
+// The engine embedding + the §11.9 state machine (R3/R4/R5). Built on the S0a-verified
+// recipe (flue's generated node entry, mirrored): sqlite(path) stores → coordinator →
+// createAdmission drives runs (contract 19 — flue generates submission ids; the package
+// keeps its own durable turn-map). The embedding surface is @flue/runtime/internal —
+// explicitly NOT their public API; the peer dep is exact-range-pinned for this reason
+// (012 §6.5 carries the public-exports upstream ask).
+
+import { join } from "node:path";
+import { registerProvider } from "@flue/runtime";
+import { sqlite } from "@flue/runtime/node";
+import {
+  Bash, InMemoryFs, bashFactoryToSessionEnv, createFlueContext,
+  createNodeAgentCoordinator, createNodeDispatchQueue, createRuntimeActivityGate,
+  configureFlueRuntime, resolveModel,
+} from "@flue/runtime/internal";
+import { PackageState } from "./state.js";
+import { ocSandbox } from "./sandbox.js";
+import { createOcTools, RESERVED_TOOL_NAMES } from "./tools.js";
+
+/** A decorated FlueEvent as forwarded over NDJSON (eventIndex = the step `offset`). */
+export interface ForwardedEvent {
+  type?: string;
+  eventIndex?: number;
+  [k: string]: unknown;
+}
+
+export interface TurnRequest {
+  turn_id: string;
+  attempt: number;
+  input: Array<{ role: string; content: string }>;
+  events_from_offset?: number;
+  config: {
+    model?: string;
+    system_prompt?: string;
+    mcp_endpoint?: string;
+    state_dir?: string;
+    deadline_s?: number;
+    endpoint_profile?: { mode?: string; auth_env?: string; base_url?: string };
+  };
+}
+
+export type DoneReason = "quiescent" | "awaiting_input" | "error";
+
+export interface AgentDefinitionLike {
+  __flueAgentDefinition: true;
+  initialize: (ctx: unknown) => unknown | Promise<unknown>;
+}
+
+interface SubmissionRow {
+  submissionId: string;
+  status: string;
+  acceptedAt?: number;
+  attemptId?: string;
+  attempt?: { attemptId?: string };
+}
+
+interface Submissions {
+  getSubmission(id: string): Promise<SubmissionRow | null>;
+  hasUnsettledSubmissions(): Promise<boolean>;
+  listRunningSubmissions(): Promise<SubmissionRow[]>;
+  listRunnableSubmissions(): Promise<SubmissionRow[]>;
+  listUnreadySubmissions(): Promise<SubmissionRow[]>;
+  failSubmission(attempt: { submissionId: string; attemptId: string }, error: unknown): Promise<unknown>;
+}
+
+interface Coordinator {
+  createAdmission(agent: string, instance: string): (
+    payload: { message: string },
+    onEvent?: (ev: ForwardedEvent) => void,
+    waitForResult?: boolean,
+  ) => Promise<{ submissionId: string; offset?: string; result?: unknown }>;
+  abortInstance(agent: string, instance: string): Promise<boolean>;
+  shutdown(timeoutMs?: number): Promise<void>;
+}
+
+interface EngineHandles {
+  state: PackageState;
+  coordinator: Coordinator;
+  submissions: Submissions;
+}
+
+export const AGENT_NAME = "oc";
+export const INSTANCE_ID = "session";
+
+let engine: EngineHandles | null = null;
+// Per-submission live event buffers. Process memory is legitimate here: the brain is
+// resident, and every non-resident recovery path goes through R4 fresh-run (012 §11.9).
+const buffers = new Map<string, ForwardedEvent[]>();
+const outcomes = new Map<string, { failed: boolean; error?: string }>();
+
+/** R2 — /healthz busy is ENGINE truth: any non-settled submission. */
+export async function engineBusy(): Promise<boolean> {
+  if (!engine) return false;
+  return engine.submissions.hasUnsettledSubmissions();
+}
+
+export async function engineShutdown(): Promise<void> {
+  await engine?.coordinator.shutdown(3000).catch(() => {});
+}
+
+function profileError(msg: string): never {
+  throw new Error(`flue profile violation: ${msg}`);
+}
+
+/** Once-per-process: stores → R4 stamp → wrapped agent → coordinator → runtime seed. */
+export async function ensureEngine(userAgent: AgentDefinitionLike, turn: TurnRequest): Promise<EngineHandles> {
+  if (engine) return engine;
+  const stateDir = turn.config.state_dir ?? process.env.OC_RUNTIME_STATE_DIR ?? "/tmp/oc-flue-state";
+  const state = new PackageState(stateDir);
+
+  // Provider registration from endpoint_profile: managed → explicit base URL + sealed env
+  // key; BYO → env key, transport rides the proxy bootstrap. Turn config is box-invariant.
+  const profile = turn.config.endpoint_profile;
+  const authEnv = profile?.auth_env ?? "ANTHROPIC_API_KEY";
+  const apiKey = process.env[authEnv];
+  if (apiKey || profile?.base_url) {
+    registerProvider("anthropic", {
+      ...(profile?.base_url ? { baseUrl: profile.base_url } : {}),
+      ...(apiKey ? { apiKey } : {}),
+    } as never);
+  }
+
+  const adapter = sqlite(join(stateDir, "flue.db"));
+  if (adapter.migrate) await adapter.migrate();
+  const stores = (await adapter.connect()) as {
+    executionStore: { submissions: Submissions };
+    runStore: unknown; eventStreamStore: unknown; conversationStreamStore: unknown; attachmentStore: unknown;
+  };
+  const submissions = stores.executionStore.submissions;
+
+  // §11.9 R4 — reconcile to quiescence BEFORE any admit (the claim loop that starts with
+  // the first admission reclaims expired leases and RESUMES continuable work). Fast path,
+  // S0a-measured ~100ms vs the 30s lease wait: directly fail each stale running row.
+  for (const row of await submissions.listRunningSubmissions()) {
+    const attemptId = row.attempt?.attemptId ?? row.attemptId;
+    if (!attemptId) continue;
+    await submissions.failSubmission({ submissionId: row.submissionId, attemptId }, new Error("stale run settled at boot (R4)"));
+  }
+
+  // R5 — durability is per-agent config in flue: apply by WRAPPING the user's definition.
+  // Profile checks here are STRUCTURAL, scoped by profile_version (the policy-free rule).
+  const deadlineS = turn.config.deadline_s ?? (Number(process.env.OC_TURN_DEADLINE_S ?? "") || 1800);
+  const timeoutMs = Math.max(60_000, (deadlineS - 15) * 1000);
+  let coordinatorRef: Coordinator | null = null;
+  const ocTools = createOcTools({
+    state,
+    abortCurrentInstance: async () => (coordinatorRef ? coordinatorRef.abortInstance(AGENT_NAME, INSTANCE_ID) : false),
+  });
+  const wrapped: AgentDefinitionLike = {
+    __flueAgentDefinition: true,
+    initialize: async (ctx: unknown) => {
+      const cfg = (await userAgent.initialize(ctx)) as Record<string, unknown>;
+      if (cfg.sandbox != null) profileError("`sandbox` must be unset — OpenComputer supplies the session sandbox");
+      const tools = Array.isArray(cfg.tools) ? (cfg.tools as Array<{ name?: string }>) : [];
+      for (const t of tools) {
+        if (t?.name && RESERVED_TOOL_NAMES.has(t.name)) profileError(`custom tool name '${t.name}' is reserved`);
+      }
+      return {
+        ...cfg,
+        // deploy-time triangle made divergence impossible; the host string wins (managed slugs)
+        model: turn.config.model ?? cfg.model,
+        durability: { maxAttempts: 1, timeoutMs },
+        sandbox: ocSandbox(),
+        tools: [...tools, ...ocTools],
+      };
+    },
+  };
+
+  const activityGate = createRuntimeActivityGate();
+  const agents = [{ name: AGENT_NAME, definition: wrapped }];
+  const mkDefaultEnv = async () =>
+    bashFactoryToSessionEnv(() => new Bash({ fs: new InMemoryFs(), network: { dangerouslyAllowFullInternetAccess: true } }));
+  const mkCtx = (args: { id: string; agentName: string; request: unknown; initialEventIndex: unknown; dispatchId: unknown }) =>
+    createFlueContext({
+      id: args.id, agentName: args.agentName, dispatchId: args.dispatchId, initialEventIndex: args.initialEventIndex,
+      env: process.env, req: args.request,
+      agentConfig: { resolveModel },
+      createDefaultEnv: mkDefaultEnv, // unreachable in practice (sandbox injected above)
+      submissionStore: submissions,
+    } as never);
+  const coordinator = createNodeAgentCoordinator({
+    submissions, agents, createContext: mkCtx,
+    conversationStreamStore: stores.conversationStreamStore, attachmentStore: stores.attachmentStore, activityGate,
+  } as never) as unknown as Coordinator;
+  coordinatorRef = coordinator;
+  configureFlueRuntime({
+    target: "node", devMode: false, temporaryLocalExposure: false, agents, workflows: [],
+    createAgentAdmission: (n: string, i: string) => coordinator.createAdmission(n, i),
+    abortAgentInstance: (n: string, i: string) => coordinator.abortInstance(n, i),
+    dispatchQueue: createNodeDispatchQueue(coordinator as never), activityGate,
+    admitWorkflow: () => { throw new Error("workflows are not supported on OpenComputer"); },
+    channelHandlers: [], createWorkflowContext: () => { throw new Error("workflows are not supported on OpenComputer"); },
+    runStore: stores.runStore, eventStreamStore: stores.eventStreamStore,
+    conversationStreamStore: stores.conversationStreamStore, attachmentStore: stores.attachmentStore,
+  } as never);
+
+  engine = { state, coordinator, submissions };
+  return engine;
+}
+
+export interface AttachResult {
+  /** events from `events_from_offset`: replay + live tail; ends when the run settles */
+  events: AsyncGenerator<ForwardedEvent>;
+  /** resolves with the done reason once settled (and the tail is drained) */
+  done: Promise<{ reason: DoneReason; error?: string }>;
+}
+
+/** §11.9 R3 — the attach protocol. */
+export async function attachTurn(userAgent: AgentDefinitionLike, turn: TurnRequest): Promise<AttachResult> {
+  const eng = await ensureEngine(userAgent, turn);
+  const key = `rt:${turn.turn_id}:${turn.attempt}`;
+  const fromOffset = turn.events_from_offset ?? -1;
+  const prior = eng.state.findTurn(turn.turn_id);
+
+  if (prior) {
+    const sub = await eng.submissions.getSubmission(prior.submissionId);
+    if (sub && sub.status !== "settled") {
+      // running → RE-ATTACH: no admit, model spend not duplicated
+      return followSubmission(eng, prior.submissionId, fromOffset, turn);
+    }
+    if (sub && sub.status === "settled") {
+      if (eng.state.consumeAwaiting(turn.turn_id)) {
+        return drainSettled(prior.submissionId, fromOffset, "awaiting_input");
+      }
+      const out = outcomes.get(prior.submissionId);
+      if (out && !out.failed) return drainSettled(prior.submissionId, fromOffset, "quiescent");
+      if (out && out.failed && out.error && !/abort/i.test(out.error)) {
+        return drainSettled(prior.submissionId, fromOffset, "error", out.error);
+      }
+      // settled-aborted (or outcome unknown from a previous life), no flag → fresh re-run:
+      // the honest claude/pi semantic, bounded duplicated-progress cost.
+    }
+  }
+
+  const submissionId = await freshAdmit(eng, key, turn);
+  return followSubmission(eng, submissionId, fromOffset, turn);
+}
+
+/** Admit through createAdmission (contract 19) and correlate the generated submission id:
+ *  the host serializes turns per session, so the single new non-settled submission after
+ *  our admit is ours. The mapping is recorded as soon as the id is known. */
+async function freshAdmit(eng: EngineHandles, key: string, turn: TurnRequest): Promise<string> {
+  const message = turn.input.map((m) => m.content).join("\n\n");
+  const before = new Set(
+    (await Promise.all([
+      eng.submissions.listRunningSubmissions(),
+      eng.submissions.listRunnableSubmissions(),
+      eng.submissions.listUnreadySubmissions(),
+    ])).flat().map((s) => s.submissionId),
+  );
+
+  const admission = eng.coordinator.createAdmission(AGENT_NAME, INSTANCE_ID);
+  const pending: ForwardedEvent[] = [];
+  // waitForResult=true is REQUIRED: false detaches the observer immediately (S0a).
+  const completion = admission({ message }, (ev) => pending.push(ev), true);
+
+  // correlate the id
+  let submissionId: string | null = null;
+  for (let i = 0; i < 200 && !submissionId; i++) {
+    const all = (await Promise.all([
+      eng.submissions.listRunningSubmissions(),
+      eng.submissions.listRunnableSubmissions(),
+      eng.submissions.listUnreadySubmissions(),
+    ])).flat();
+    const fresh = all.filter((s) => !before.has(s.submissionId));
+    if (fresh.length > 0) submissionId = fresh[fresh.length - 1].submissionId;
+    else await new Promise((r) => setTimeout(r, 25));
+  }
+  if (!submissionId) {
+    // extremely fast run: it settled before we saw it queued — take the id from completion
+    const receipt = await completion.catch(() => null);
+    if (!receipt) throw new Error("could not correlate the admitted flue submission");
+    submissionId = receipt.submissionId;
+  }
+  eng.state.recordSubmission(key, submissionId);
+  buffers.set(submissionId, pending);
+  void completion.then(
+    () => outcomes.set(submissionId as string, { failed: false }),
+    (err: unknown) => outcomes.set(submissionId as string, { failed: true, error: err instanceof Error ? err.message : String(err) }),
+  );
+  return submissionId;
+}
+
+/** Drain an already-settled run's buffered tail — no re-run, no model spend. */
+function drainSettled(submissionId: string, fromOffset: number, reason: DoneReason, error?: string): AttachResult {
+  const buf = buffers.get(submissionId) ?? [];
+  async function* gen(): AsyncGenerator<ForwardedEvent> {
+    for (const ev of buf) {
+      if ((ev.eventIndex ?? Number.MAX_SAFE_INTEGER) > fromOffset) yield ev;
+    }
+  }
+  return { events: gen(), done: Promise.resolve({ reason, ...(error ? { error } : {}) }) };
+}
+
+/** Stream a (possibly re-attached) live run: buffered replay past the cursor + live tail. */
+function followSubmission(eng: EngineHandles, submissionId: string, fromOffset: number, turn: TurnRequest): AttachResult {
+  const buf = buffers.get(submissionId) ?? [];
+  buffers.set(submissionId, buf);
+  let settled = false;
+
+  const done = (async (): Promise<{ reason: DoneReason; error?: string }> => {
+    for (;;) {
+      const sub = await eng.submissions.getSubmission(submissionId);
+      if (sub?.status === "settled") break;
+      await new Promise((r) => setTimeout(r, 150));
+    }
+    settled = true;
+    if (eng.state.consumeAwaiting(turn.turn_id)) return { reason: "awaiting_input" };
+    const out = outcomes.get(submissionId);
+    if (out?.failed && out.error && !/abort/i.test(out.error)) return { reason: "error", error: out.error };
+    return { reason: "quiescent" };
+  })();
+
+  async function* gen(): AsyncGenerator<ForwardedEvent> {
+    let idx = 0;
+    for (;;) {
+      while (idx < buf.length) {
+        const ev = buf[idx++];
+        if ((ev.eventIndex ?? Number.MAX_SAFE_INTEGER) > fromOffset) yield ev;
+      }
+      if (settled && idx >= buf.length) return;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+  }
+  return { events: gen(), done };
+}
