@@ -6,6 +6,7 @@
 // settle, and the next admission continues with full context.
 
 import { defineTool } from "@flue/runtime";
+import * as v from "valibot";
 import { mcpCall, activeTurn } from "./mcp-client.js";
 import type { PackageState } from "./state.js";
 
@@ -14,21 +15,12 @@ export interface ToolWiring {
   abortCurrentInstance: () => Promise<boolean>;
 }
 
-// Input schemas are plain JSON-schema-shaped objects via flue's schema-agnostic accept
-// (StandardSchema/valibot/raw). We use valibot-free structural inputs: flue accepts raw
-// JSON Schema for tool inputs per its ToolInputSchema union.
-// W1 note: if the peer's defineTool rejects raw schema, swap to valibot (devDep present).
-
 export function createOcTools(wiring: ToolWiring): unknown[] {
   const say = defineTool({
     name: "say",
     description:
       "Post a short user-visible progress message. Use sparingly for meaningful status; the final answer is delivered automatically.",
-    input: {
-      type: "object",
-      properties: { text: { type: "string", description: "the message to show the user" } },
-      required: ["text"],
-    } as never,
+    input: v.object({ text: v.string() }),
     async run(ctx: { input?: { text?: string } }) {
       const text = ctx.input?.text ?? "";
       await mcpCall("say", { text });
@@ -40,11 +32,7 @@ export function createOcTools(wiring: ToolWiring): unknown[] {
     name: "ask",
     description:
       "Ask the user a question and END this run — the session waits for their reply at zero cost and resumes with the answer as the next message. Use when you cannot proceed without input.",
-    input: {
-      type: "object",
-      properties: { question: { type: "string", description: "the question for the user" } },
-      required: ["question"],
-    } as never,
+    input: v.object({ question: v.string() }),
     async run(ctx: { input?: { question?: string } }) {
       const question = ctx.input?.question ?? "";
       await mcpCall("ask", { question });
