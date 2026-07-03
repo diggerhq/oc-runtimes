@@ -3,7 +3,7 @@
   "version": "0.0.1",
   "private": true,
   "type": "module",
-  "description": "Durable Agent Sessions (v3) flue runtime image (design 012 §11.6). Hosts a USER-BUILT flue artifact (a self-contained ESM bundle whose entry calls @opencomputer/flue's serveOC) as an OC brain behind the v3 runtime contract. Same adapter shape as claude/codex/pi: a per-turn OC-aware driver (adapter-core) + a resident OC-unaware brain — except the brain is the artifact, not baked into the image. This package ships ONLY the adapter-side consumer: a RuntimeSpec (FlueEvent v:3 → OC taxonomy translation, mcp subset, sources note), a launcher that resolves + imports the materialized artifact, and the aggregated-skills-mount helper. It NEVER links @flue/runtime — it knows flue's wire shapes, not its code, which is why it hosts whichever artifact lands in it.",
+  "description": "Durable Agent Sessions (v3) flue runtime image (design 012 \u00a711.6). Hosts a USER-BUILT flue artifact (a self-contained ESM bundle whose entry calls @opencomputer/flue's serveOC) as an OC brain behind the v3 runtime contract. Same adapter shape as claude/codex/pi: a per-turn OC-aware driver (adapter-core) + a resident OC-unaware brain \u2014 except the brain is the artifact, not baked into the image. This package ships ONLY the adapter-side consumer: a RuntimeSpec (FlueEvent v:3 \u2192 OC taxonomy translation, mcp subset, sources note), a launcher that resolves + imports the materialized artifact, and the aggregated-skills-mount helper. It NEVER links @flue/runtime \u2014 it knows flue's wire shapes, not its code, which is why it hosts whichever artifact lands in it.",
   "bin": {
     "oc-runtime-flue": "dist/adapter.js"
   },
@@ -17,6 +17,8 @@
     "test": "npx -y tsx test/translate.test.ts && npx -y tsx test/skills-mount.test.ts && npx -y tsx test/launcher.test.ts && npx -y tsx test/cursor.test.ts && npx -y tsx test/fixture-smoke.test.ts"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^4.0.0",
     "@oc/adapter-core": "file:../adapter-core"
   },
   "devDependencies": {
