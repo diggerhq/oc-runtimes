@@ -6,7 +6,7 @@
 
 import { createServer, type ServerResponse } from "node:http";
 import { installProxyFetch } from "./proxy.js";
-import { activeTurn } from "./mcp-client.js";
+import { activeTurn, mcpPing } from "./mcp-client.js";
 import {
   attachTurn, engineBusy, type AgentDefinitionLike, type TurnRequest, type ForwardedEvent,
 } from "./flue-glue.js";
@@ -109,6 +109,11 @@ export function serveOC(agent: AgentDefinitionLike): void {
 
       res.writeHead(200, { "content-type": "application/x-ndjson", "cache-control": "no-cache" });
       try {
+        // Preflight the MCP host: a dead host wedges flue's claim in silent queued-retry
+        // (env-setup probes run at session build). Fail the turn loudly instead.
+        await mcpPing().catch((err) => {
+          throw new Error(`MCP host unreachable at ${activeTurn.mcpEndpoint ?? "<unset>"}: ${err instanceof Error ? err.message : String(err)}`);
+        });
         const attached = await attachTurn(agent, turn);
         for await (const ev of attached.events) {
           if (detached) break; // keep consuming? no — the buffer retains events; just stop writing

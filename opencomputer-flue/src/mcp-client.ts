@@ -38,3 +38,19 @@ export async function mcpCall(name: string, args: Record<string, unknown>): Prom
     await client.close().catch(() => {});
   }
 }
+
+/** Preflight: is the turn's MCP host reachable? Used by serveOC before attaching — a dead
+ *  host would otherwise wedge the claim in silent queued-retry (flue retries env-setup
+ *  failures without settling; P0 finding). */
+export async function mcpPing(): Promise<void> {
+  const endpoint = activeTurn.mcpEndpoint;
+  if (!endpoint) throw new NoActiveTurnError();
+  const transport = new StreamableHTTPClientTransport(new URL(endpoint));
+  const client = new Client({ name: "opencomputer-flue", version: "0.1.0" });
+  await client.connect(transport);
+  try {
+    await client.listTools();
+  } finally {
+    await client.close().catch(() => {});
+  }
+}
