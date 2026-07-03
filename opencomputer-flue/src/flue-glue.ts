@@ -41,6 +41,25 @@ export interface TurnRequest {
 
 export type DoneReason = "quiescent" | "awaiting_input" | "error";
 
+/** The R3 branch taken, stamped on the done line so the adapter can emit `runtime.*`
+ *  lifecycle telemetry (012 §11.9 — flight recorder, not billing). */
+export interface TurnDisposition {
+  attach_mode: "fresh" | "reattach" | "drain_settled";
+  /** set when the fresh path had to abort a different turn's unsettled run first */
+  orphan_abort?: { aborted: number; waited_ms: number };
+  /** R4 boot reconcile count — reported once, on the first turn after boot */
+  stale_runs_settled?: number;
+}
+
+/** Orphan-abort timed out: the engine holds a run that will not settle. The brain must die
+ *  (killBrain fallback) so the next attempt boots a fresh engine and R4 reconciles. */
+export class OrphanWedgedError extends Error {
+  constructor(count: number, waitedMs: number) {
+    super(`orphan run(s) did not settle within ${waitedMs}ms of abort (${count} unsettled) — engine wedged`);
+    this.name = "OrphanWedgedError";
+  }
+}
+
 export interface AgentDefinitionLike {
   __flueAgentDefinition: true;
   initialize: (ctx: unknown) => unknown | Promise<unknown>;
@@ -87,6 +106,8 @@ let engine: EngineHandles | null = null;
 // resident, and every non-resident recovery path goes through R4 fresh-run (012 §11.9).
 const buffers = new Map<string, ForwardedEvent[]>();
 const outcomes = new Map<string, { failed: boolean; error?: string }>();
+// R4 boot-reconcile count, surfaced on the FIRST done line after boot then cleared.
+let staleRunsSettledAtBoot = 0;
 
 /** R2 — /healthz busy is ENGINE truth: any non-settled submission. */
 export async function engineBusy(): Promise<boolean> {
@@ -135,6 +156,7 @@ export async function ensureEngine(userAgent: AgentDefinitionLike, turn: TurnReq
     const attemptId = row.attempt?.attemptId ?? row.attemptId;
     if (!attemptId) continue;
     await submissions.failSubmission({ submissionId: row.submissionId, attemptId }, new Error("stale run settled at boot (R4)"));
+    staleRunsSettledAtBoot++;
   }
 
   // R5 — durability is per-agent config in flue: apply by WRAPPING the user's definition.
@@ -203,10 +225,34 @@ export interface AttachResult {
   events: AsyncGenerator<ForwardedEvent>;
   /** resolves with the done reason once settled (and the tail is drained) */
   done: Promise<{ reason: DoneReason; error?: string }>;
+  /** the R3 branch taken — serveOC stamps it on the done line */
+  disposition: TurnDisposition;
 }
 
-/** §11.9 R3 — the attach protocol. */
-export async function attachTurn(userAgent: AgentDefinitionLike, turn: TurnRequest): Promise<AttachResult> {
+/** The one-shot R4 report: attached to the first disposition after boot, then cleared. */
+function takeStaleRunsSettled(): { stale_runs_settled?: number } {
+  if (staleRunsSettledAtBoot === 0) return {};
+  const n = staleRunsSettledAtBoot;
+  staleRunsSettledAtBoot = 0;
+  return { stale_runs_settled: n };
+}
+
+// Serializes the lookup/admit phase across handlers: a detached handler releases the HTTP
+// stream slot immediately (R1 — the engine keeps running), so a re-attaching attempt can
+// arrive while the previous handler's attachTurn is still mid-admit. Without this chain the
+// two would race freshAdmit and double-admit the same turn.
+let attachChain: Promise<unknown> = Promise.resolve();
+
+/** §11.9 R3 — the attach protocol. `isLive` reports whether the calling subscriber is still
+ *  connected — a detached handler must never consume the awaiting flag (its done line is
+ *  never written; the flag belongs to the attempt that will actually deliver it). */
+export function attachTurn(userAgent: AgentDefinitionLike, turn: TurnRequest, isLive: () => boolean = () => true): Promise<AttachResult> {
+  const run = attachChain.then(() => attachTurnSerialized(userAgent, turn, isLive));
+  attachChain = run.catch(() => {});
+  return run;
+}
+
+async function attachTurnSerialized(userAgent: AgentDefinitionLike, turn: TurnRequest, isLive: () => boolean): Promise<AttachResult> {
   const eng = await ensureEngine(userAgent, turn);
   const key = `rt:${turn.turn_id}:${turn.attempt}`;
   const fromOffset = turn.events_from_offset ?? -1;
@@ -216,24 +262,68 @@ export async function attachTurn(userAgent: AgentDefinitionLike, turn: TurnReque
     const sub = await eng.submissions.getSubmission(prior.submissionId);
     if (sub && sub.status !== "settled") {
       // running → RE-ATTACH: no admit, model spend not duplicated
-      return followSubmission(eng, prior.submissionId, fromOffset, turn);
+      return followSubmission(eng, prior.submissionId, fromOffset, turn, { attach_mode: "reattach", ...takeStaleRunsSettled() }, isLive);
     }
     if (sub && sub.status === "settled") {
+      const drained: TurnDisposition = { attach_mode: "drain_settled", ...takeStaleRunsSettled() };
       if (eng.state.consumeAwaiting(turn.turn_id)) {
-        return drainSettled(prior.submissionId, fromOffset, "awaiting_input");
+        return drainSettled(prior.submissionId, fromOffset, "awaiting_input", undefined, drained);
       }
       const out = outcomes.get(prior.submissionId);
-      if (out && !out.failed) return drainSettled(prior.submissionId, fromOffset, "quiescent");
+      if (out && !out.failed) return drainSettled(prior.submissionId, fromOffset, "quiescent", undefined, drained);
       if (out && out.failed && out.error && !/abort/i.test(out.error)) {
-        return drainSettled(prior.submissionId, fromOffset, "error", out.error);
+        return drainSettled(prior.submissionId, fromOffset, "error", out.error, drained);
       }
       // settled-aborted (or outcome unknown from a previous life), no flag → fresh re-run:
       // the honest claude/pi semantic, bounded duplicated-progress cost.
     }
   }
 
+  // R3 orphan-abort — only on the fresh paths: abortInstance is SESSION-WIDE (queued+running),
+  // so it must never fire while THIS turn's own run is live (the reattach/drain branches above).
+  // Turns are host-serialized, so an orphan here is a fenced predecessor's run (012 §11.9).
+  const orphan = await abortOrphans(eng, turn.turn_id);
+
   const submissionId = await freshAdmit(eng, key, turn);
-  return followSubmission(eng, submissionId, fromOffset, turn);
+  return followSubmission(eng, submissionId, fromOffset, turn, {
+    attach_mode: "fresh",
+    ...(orphan ? { orphan_abort: orphan } : {}),
+    ...takeStaleRunsSettled(),
+  }, isLive);
+}
+
+const ORPHAN_ABORT_TIMEOUT_MS = Number(process.env.OC_ORPHAN_ABORT_TIMEOUT_MS ?? "") || 30_000;
+
+/** Abort every unsettled run NOT belonging to `turnId` and wait for it to settle.
+ *  `abortInstance` stamps abort_requested_at on queued AND running rows and arms the
+ *  reconcile wake — a queued orphan settles-aborted at claim WITHOUT running (verified in
+ *  @flue/runtime processSubmission). A run that ignores its abort signal keeps the engine
+ *  wedged → OrphanWedgedError → serveOC dies (killBrain fallback) → next boot R4-reconciles. */
+async function abortOrphans(eng: EngineHandles, turnId: string): Promise<{ aborted: number; waited_ms: number } | null> {
+  const listUnsettled = async (): Promise<SubmissionRow[]> =>
+    (await Promise.all([
+      eng.submissions.listRunningSubmissions(),
+      eng.submissions.listRunnableSubmissions(),
+      eng.submissions.listUnreadySubmissions(),
+    ])).flat();
+
+  // Unmapped unsettled rows count as orphans too: a crash between admit and turn-map record
+  // leaves one, and admitting a SECOND concurrent run of the same input is strictly worse.
+  const orphans = (await listUnsettled()).filter((s) => eng.state.turnForSubmission(s.submissionId) !== turnId);
+  if (orphans.length === 0) return null;
+  const ids = new Set(orphans.map((s) => s.submissionId));
+
+  const started = Date.now();
+  await eng.coordinator.abortInstance(AGENT_NAME, INSTANCE_ID);
+  for (;;) {
+    const stillUnsettled = (await listUnsettled()).filter((s) => ids.has(s.submissionId));
+    if (stillUnsettled.length === 0) break;
+    if (Date.now() - started > ORPHAN_ABORT_TIMEOUT_MS) {
+      throw new OrphanWedgedError(stillUnsettled.length, Date.now() - started);
+    }
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  return { aborted: ids.size, waited_ms: Date.now() - started };
 }
 
 /** Admit through createAdmission (contract 19) and correlate the generated submission id:
@@ -282,18 +372,18 @@ async function freshAdmit(eng: EngineHandles, key: string, turn: TurnRequest): P
 }
 
 /** Drain an already-settled run's buffered tail — no re-run, no model spend. */
-function drainSettled(submissionId: string, fromOffset: number, reason: DoneReason, error?: string): AttachResult {
+function drainSettled(submissionId: string, fromOffset: number, reason: DoneReason, error: string | undefined, disposition: TurnDisposition): AttachResult {
   const buf = buffers.get(submissionId) ?? [];
   async function* gen(): AsyncGenerator<ForwardedEvent> {
     for (const ev of buf) {
       if ((ev.eventIndex ?? Number.MAX_SAFE_INTEGER) > fromOffset) yield ev;
     }
   }
-  return { events: gen(), done: Promise.resolve({ reason, ...(error ? { error } : {}) }) };
+  return { events: gen(), done: Promise.resolve({ reason, ...(error ? { error } : {}) }), disposition };
 }
 
 /** Stream a (possibly re-attached) live run: buffered replay past the cursor + live tail. */
-function followSubmission(eng: EngineHandles, submissionId: string, fromOffset: number, turn: TurnRequest): AttachResult {
+function followSubmission(eng: EngineHandles, submissionId: string, fromOffset: number, turn: TurnRequest, disposition: TurnDisposition, isLive: () => boolean): AttachResult {
   const buf = buffers.get(submissionId) ?? [];
   buffers.set(submissionId, buf);
   let settled = false;
@@ -305,7 +395,9 @@ function followSubmission(eng: EngineHandles, submissionId: string, fromOffset: 
       await new Promise((r) => setTimeout(r, 150));
     }
     settled = true;
-    if (eng.state.consumeAwaiting(turn.turn_id)) return { reason: "awaiting_input" };
+    // A detached subscriber's done line is never written — leave the awaiting flag for the
+    // re-attaching attempt that WILL deliver it (the reported reason here is discarded).
+    if (isLive() && eng.state.consumeAwaiting(turn.turn_id)) return { reason: "awaiting_input" };
     const out = outcomes.get(submissionId);
     if (out?.failed && out.error && !/abort/i.test(out.error)) return { reason: "error", error: out.error };
     return { reason: "quiescent" };
@@ -322,5 +414,5 @@ function followSubmission(eng: EngineHandles, submissionId: string, fromOffset: 
       await new Promise((r) => setTimeout(r, 50));
     }
   }
-  return { events: gen(), done };
+  return { events: gen(), done, disposition };
 }

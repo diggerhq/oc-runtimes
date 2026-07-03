@@ -8,7 +8,8 @@ import { createServer, type ServerResponse } from "node:http";
 import { installProxyFetch } from "./proxy.js";
 import { activeTurn, mcpPing } from "./mcp-client.js";
 import {
-  attachTurn, engineBusy, type AgentDefinitionLike, type TurnRequest, type ForwardedEvent,
+  attachTurn, engineBusy, OrphanWedgedError,
+  type AgentDefinitionLike, type TurnRequest, type ForwardedEvent,
 } from "./flue-glue.js";
 
 const CONTRACT_VERSION = "1";
@@ -58,13 +59,16 @@ export function serveOC(agent: AgentDefinitionLike): void {
 
   installProxyFetch();
   const port = Number(process.env.OC_BRAIN_PORT ?? "8080");
-  let turnInFlight = false;
+  // The single-live-subscriber slot. A DETACHED handler releases it immediately (R1: the
+  // socket is gone, the engine keeps running) so a re-attaching attempt is never 409'd
+  // into waiting out the whole run it is trying to re-attach to.
+  let activeStream: symbol | null = null;
   let seq = 0;
 
   const srv = createServer((req, res) => {
     void (async () => {
       if (req.method === "GET" && req.url?.startsWith("/healthz")) {
-        const busy = turnInFlight || (await engineBusy());
+        const busy = activeStream !== null || (await engineBusy());
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify({ status: "ready", contract_version: CONTRACT_VERSION, busy }));
         return;
@@ -74,7 +78,7 @@ export function serveOC(agent: AgentDefinitionLike): void {
         res.end(JSON.stringify({ error: { type: "not_found" } }));
         return;
       }
-      if (turnInFlight) {
+      if (activeStream !== null) {
         res.writeHead(409, { "content-type": "application/json" });
         res.end(JSON.stringify({ error: { type: "busy", message: "a turn is already streaming" } }));
         return;
@@ -97,11 +101,22 @@ export function serveOC(agent: AgentDefinitionLike): void {
         return;
       }
 
-      turnInFlight = true;
-      // R1: socket close = subscriber detached, engine untouched. We only stop writing.
+      const me = Symbol("turn-stream");
+      activeStream = me;
+      const release = (): void => {
+        if (activeStream === me) activeStream = null;
+      };
+      // R1: socket close = subscriber detached, engine untouched. Stop writing AND free the
+      // slot — the next attempt re-attaches (or drains) through the R3 protocol. The hook is
+      // on the RESPONSE: req 'close' does not fire on client abort mid-response (it tracks
+      // message completion), res 'close' fires on premature termination and on normal end —
+      // writableEnded distinguishes the two.
       let detached = false;
-      req.on("close", () => {
-        if (!res.writableEnded) detached = true;
+      res.on("close", () => {
+        if (!res.writableEnded) {
+          detached = true;
+          release();
+        }
       });
 
       activeTurn.mcpEndpoint = turn.config?.mcp_endpoint ?? null;
@@ -114,25 +129,39 @@ export function serveOC(agent: AgentDefinitionLike): void {
         await mcpPing().catch((err) => {
           throw new Error(`MCP host unreachable at ${activeTurn.mcpEndpoint ?? "<unset>"}: ${err instanceof Error ? err.message : String(err)}`);
         });
-        const attached = await attachTurn(agent, turn);
+        const attached = await attachTurn(agent, turn, () => !detached);
         for await (const ev of attached.events) {
-          if (detached) break; // keep consuming? no — the buffer retains events; just stop writing
+          if (detached) return; // abandoned — the buffer retains events for the re-attach
           writeLine(res, { seq: seq++, kind: (ev as ForwardedEvent).type, offset: (ev as ForwardedEvent).eventIndex, msg: ev });
         }
+        if (detached) return;
         const done = await attached.done;
         if (!detached) {
-          writeLine(res, { kind: "done", reason: done.reason, ...(done.error ? { error: { type: "engine", message: done.error } } : {}) });
+          // The disposition rides the done line (attach_mode + orphan/R4 counts) — the
+          // adapter turns it into runtime.* lifecycle telemetry (012 §11.9).
+          writeLine(res, { kind: "done", reason: done.reason, ...attached.disposition, ...(done.error ? { error: { type: "engine", message: done.error } } : {}) });
         }
       } catch (err) {
         if (!detached) {
           writeLine(res, {
             kind: "done",
             reason: "error",
-            error: { type: "brain", message: err instanceof Error ? err.message : String(err) },
+            error: {
+              type: err instanceof OrphanWedgedError ? "orphan_wedged" : "brain",
+              message: err instanceof Error ? err.message : String(err),
+            },
           });
         }
+        if (err instanceof OrphanWedgedError) {
+          // killBrain fallback (§11.9 R3): the engine holds a run that will not settle —
+          // this process is poisoned. Die after the response flushes; the next attempt
+          // boots a fresh engine and R4 settles the wedge.
+          res.end(() => process.exit(1));
+          setTimeout(() => process.exit(1), 2000).unref();
+          return;
+        }
       } finally {
-        turnInFlight = false;
+        release();
         if (!res.writableEnded) res.end();
       }
     })().catch(() => {

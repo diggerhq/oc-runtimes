@@ -55,6 +55,19 @@ export class PackageState {
     return last ? map[last] : null;
   }
 
+  /** Reverse lookup for the orphan sweep: which turn admitted this submission (null = unmapped,
+   *  i.e. a crash landed between admit and record — treated as an orphan by the caller). */
+  turnForSubmission(submissionId: string): string | null {
+    const map = this.readJson<Record<string, TurnMapEntry>>(this.mapPath, {});
+    for (const [key, entry] of Object.entries(map)) {
+      if (entry.submissionId === submissionId) {
+        const m = /^rt:(.+):\d+$/.exec(key);
+        return m ? m[1] : null;
+      }
+    }
+    return null;
+  }
+
   /** The persisted ask flag. Set by the ask tool BEFORE it aborts; cleared when consumed. */
   setAwaiting(turnId: string): void {
     writeFileSync(this.awaitingPath, JSON.stringify({ turnId, at: new Date().toISOString() }));

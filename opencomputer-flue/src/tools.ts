@@ -45,6 +45,11 @@ export function createOcTools(wiring: ToolWiring): unknown[] {
   return [say, ask];
 }
 
+// The reserved set is EXACTLY the adapter-suppressed set (translate's dedup rule) plus the
+// injected pair — a user tool with one of these names would be silently invisible in the OC
+// event log (or collide with the injection). grep/glob are here because flue's built-ins
+// execute via env.exec → the OC sandbox → MCP bash (verified in @flue/runtime dist), so
+// their calls are already evented and translate suppresses the names.
 export const RESERVED_TOOL_NAMES: ReadonlySet<string> = new Set([
-  "bash", "read", "write", "edit", "ls", "say", "ask",
+  "bash", "read", "write", "edit", "ls", "grep", "glob", "say", "ask",
 ]);

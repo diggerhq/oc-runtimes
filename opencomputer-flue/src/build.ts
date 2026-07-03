@@ -11,7 +11,10 @@ import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
 
 const PROFILE_VERSION = 1;
-const RESERVED = new Set(["bash", "read", "write", "edit", "ls", "say", "ask"]);
+// Keep in lockstep with RESERVED_TOOL_NAMES in tools.ts (the runtime check) and translate's
+// PROXIED_TOOLS in the flue adapter — reserved = suppressed+injected, so no user tool can
+// ever be silently dropped from the OC event log.
+const RESERVED = new Set(["bash", "read", "write", "edit", "ls", "grep", "glob", "say", "ask"]);
 const ENTRY_CANDIDATES = ["src/opencomputer.ts", "src/oc.ts", "oc.ts"];
 
 function fail(msg: string): never {

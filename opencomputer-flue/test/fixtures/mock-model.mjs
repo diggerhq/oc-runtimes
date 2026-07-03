@@ -21,7 +21,7 @@ export function startMock({ port = 0, onRequest = () => {} } = {}) {
       const usage = { input_tokens: 5, output_tokens: 7 };
       if (wantTool) {
         const target = (parsed.tools ?? []).find((t) => t.name === (process.env.MOCK_TOOL_NAME || 'ping_probe')) ?? parsed.tools[0];
-        const tu = { type: 'tool_use', id: 'toolu_01', name: target.name, input: { probe: 'x' } };
+        const tu = { type: 'tool_use', id: 'toolu_01', name: target.name, input: JSON.parse(process.env.MOCK_TOOL_INPUT || '{"probe":"x"}') };
         if (parsed.stream) {
           sse(res, [
             ['message_start', { type: 'message_start', message: { id: 'msg_1', type: 'message', role: 'assistant', content: [], model: parsed.model, usage } }],

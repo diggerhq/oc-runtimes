@@ -13,13 +13,14 @@
 //      exactly as pi's brain surfaces assistant text — the driver promotes the LAST one if
 //      no say/ask ran).
 //   2. TOOL-EVENT DEDUP: tool_start/tool → OC tool.call ONLY for in-process CUSTOM tools
-//      (names OUTSIDE the proxied set {bash,read,write,edit,ls,say,ask}). The sandbox tools
-//      + say/ask are already evented by the adapter's MCP host at execution time, so
-//      re-eventing them here would double every call. `edit` is in the suppressed set even
-//      though it is NOT an MCP tool: flue's `edit` built-in composes over SandboxApi
-//      read/write, so its effects already surface as read/write MCP tool events (no
-//      observability hole). The reserved-name rule (012 §11.2.8) keeps user custom tools
-//      out of this set, so a custom tool can never be silently suppressed.
+//      (names OUTSIDE the proxied set {bash,read,write,edit,ls,grep,glob,say,ask}). The
+//      sandbox tools + say/ask are already evented by the adapter's MCP host at execution
+//      time, so re-eventing them here would double every call. `edit`/`grep`/`glob` are in
+//      the suppressed set even though they are NOT MCP tools: flue's built-ins compose over
+//      the session sandbox (edit → SandboxApi read/write; grep/glob → env.exec = MCP bash),
+//      so their effects already surface as MCP tool events (no observability hole). The
+//      reserved-name rule (012 §11.2.8) keeps user custom tools out of this set, so a
+//      custom tool can never be silently suppressed.
 //
 // Everything else — text/thinking deltas, log, idle, operation*/compaction*/task*,
 // message_start, turn_start/turn_request/turn_messages — is dropped (noise or covered by a
@@ -28,10 +29,14 @@
 
 import type { DurableEmitter, TranslateCtx } from "@oc/adapter-core";
 
-// The tools whose calls the MCP host already events (012 §11.6 dedup rule). `edit` is
-// suppressed here despite not being an MCP tool — see the header. Frozen so a future edit
-// keeps it a value check, not an accidental widening.
-const PROXIED_TOOLS: ReadonlySet<string> = new Set(["bash", "read", "write", "edit", "ls", "say", "ask"]);
+// The tools whose calls the MCP host already events (012 §11.6 dedup rule). `edit`, `grep`
+// and `glob` are suppressed despite not being MCP tools: flue's built-ins compose over the
+// session sandbox (edit → SandboxApi read/write; grep/glob → env.exec, i.e. MCP bash —
+// verified in @flue/runtime dist), so their effects already surface as MCP tool events.
+// Mirrors RESERVED_TOOL_NAMES in @opencomputer/flue — reserved = suppressed+injected, so a
+// user custom tool can never be silently dropped. Frozen so a future edit keeps it a value
+// check, not an accidental widening.
+const PROXIED_TOOLS: ReadonlySet<string> = new Set(["bash", "read", "write", "edit", "ls", "grep", "glob", "say", "ask"]);
 
 // ── The subset of the FlueEvent (v:3) union we consume (structural, not imported). ──
 

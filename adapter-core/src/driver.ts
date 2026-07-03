@@ -435,6 +435,9 @@ export function runAdapter(spec: RuntimeSpec): void {
     let brainSteps = 0;     // native steps the brain streamed (excl. the terminal `done`)
     let terminalReason: string | null = null;
     let terminalError: { type?: string; message?: string } | undefined;
+    // §11.9 lifecycle markers a brain may stamp on its done line (flue's serveOC does;
+    // brains that don't are unaffected — all fields optional).
+    let terminalDone: { attach_mode?: string; orphan_abort?: { aborted?: number; waited_ms?: number }; stale_runs_settled?: number } | undefined;
 
     try {
       await ensureBrain();
@@ -487,7 +490,7 @@ export function runAdapter(spec: RuntimeSpec): void {
       if (!res.ok || !res.body) throw new Error(`brain /turn ${res.status}: ${await res.text().catch(() => "")}`);
 
       for await (const step of ndjsonLines(res.body)) {
-        if (step?.kind === "done") { terminalReason = step.reason ?? "quiescent"; terminalError = step.error; break; }
+        if (step?.kind === "done") { terminalReason = step.reason ?? "quiescent"; terminalError = step.error; terminalDone = step; break; }
         brainSteps++;
         try {
           await spec.translate(em, step.msg, translateCtx);   // backpressure: the brain blocks on the socket if we're slow
@@ -510,14 +513,34 @@ export function runAdapter(spec: RuntimeSpec): void {
     // ── Fence/cancel ladder (§3.7b) ────────────────────────────────────────────
     if (fenced) {
       ac.abort();                                  // cooperative: the brain observes req close → aborts its query
-      const ended = await waitBrainIdle(FENCE_GRACE_MS);
-      if (!ended) killBrain();                      // stuck turn must not poison the resident brain
+      if (spec.busyPolicy === "reattach") {
+        // Admit-and-detach engine (012 §11.9 R1): detach never aborts, so the brain will NOT
+        // go idle — and killing it here would defeat the successor's warm re-attach. The run
+        // self-terminates within the wired deadline (R5) or the successor's attach
+        // orphan-aborts it (R3, with its own ORPHAN_ABORT_TIMEOUT → killBrain escape).
+        console.error("[adapter] fenced — yielding (busyPolicy=reattach: engine left for R3/R5)");
+      } else {
+        const ended = await waitBrainIdle(FENCE_GRACE_MS);
+        if (!ended) killBrain();                    // stuck turn must not poison the resident brain
+        console.error("[adapter] fenced — yielding");
+      }
       await em.drain().catch(() => {});
-      console.error("[adapter] fenced — yielding");
       process.exit(0);
     }
 
     // ── Disposition ────────────────────────────────────────────────────────────
+    // §11.9 lifecycle telemetry (flight recorder): surface the R3 branch the brain took.
+    // Only brains that stamp the done line produce these (flue); `fresh` is the normal
+    // path and stays silent. runtime.fallback-style internal events, never user-visible.
+    if (terminalDone?.attach_mode === "reattach" || terminalDone?.attach_mode === "drain_settled") {
+      await em.emit({ type: `runtime.${terminalDone.attach_mode}`, level: "internal", body: { turn_id: turnId, attempt: turnAttempt } }).catch(() => {});
+    }
+    if (terminalDone?.orphan_abort) {
+      await em.emit({ type: "runtime.orphan_abort", level: "internal", body: { turn_id: turnId, attempt: turnAttempt, ...terminalDone.orphan_abort } }).catch(() => {});
+    }
+    if (terminalDone?.stale_runs_settled) {
+      await em.emit({ type: "runtime.stale_run_settled", level: "internal", body: { turn_id: turnId, attempt: turnAttempt, count: terminalDone.stale_runs_settled } }).catch(() => {});
+    }
     await em.drain();
     // Diagnostic: a turn the brain ended with ZERO steps is an anomaly (the resident brain
     // produced nothing — e.g. an MCP/tool-loading hang). Surface the brain.log tail + the
