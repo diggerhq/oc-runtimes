@@ -14,11 +14,30 @@ const ok = (n: string, c: boolean, e = "") => { console.log(`${c ? "ok  " : "FAI
 
 interface Op { op: "exec" | "write" | "read"; arg: string }
 
+// The mount now pushes skill files as RAW BYTES via base64-over-exec (#13), not sandbox.write
+// (which is utf8-only and used only for the marker). The fake emulates the exact command set
+// buildSkillsMount emits so `files` reflects what actually lands on the hands box:
+//   rm -rf 'M' && mkdir -p 'M'                      → clear the M/ prefix
+//   mkdir -p 'D' && : > 'P.b64'                     → start a base64 accumulator for P
+//   printf %s 'CHUNK' >> 'P.b64'                    → append a chunk
+//   base64 -d 'P.b64' > 'P' && rm -f 'P.b64' && …   → decode into P (the real file content)
+//   [ -d 'S' ] && cp -Rpn 'S/.' 'M/' || true        → source copy (no-clobber, mode-preserving)
 function fakeSandbox(seed: Record<string, string> = {}): { sandbox: HandsSandbox; ops: Op[]; files: Record<string, string> } {
   const ops: Op[] = [];
   const files: Record<string, string> = { ...seed };
+  const b64: Record<string, string> = {};
+  const q = (cmd: string): string[] => Array.from(cmd.matchAll(/'((?:[^']|'\\'')*)'/g)).map((m) => m[1].replace(/'\\''/g, "'"));
   const sandbox: HandsSandbox = {
-    async exec(command: string) { ops.push({ op: "exec", arg: command }); return { exitCode: 0, stdout: "" }; },
+    async exec(command: string) {
+      ops.push({ op: "exec", arg: command });
+      const args = q(command);
+      if (/^rm -rf /.test(command)) { const pfx = args[0]; for (const k of Object.keys(files)) if (k === pfx || k.startsWith(pfx + "/")) delete files[k]; }
+      else if (/: > /.test(command)) { b64[args[args.length - 1]] = ""; }
+      else if (/^printf %s /.test(command)) { const dst = args[args.length - 1]; b64[dst] = (b64[dst] ?? "") + args[0]; }
+      else if (/^base64 -d /.test(command)) { const src = args[0], dst = args[1]; files[dst] = Buffer.from(b64[src] ?? "", "base64").toString("utf8"); delete b64[src]; }
+      // cp -Rpn from a (nonexistent-in-fake) source dir is a no-op on `files`; the ops record proves it ran.
+      return { exitCode: 0, stdout: "" };
+    },
     async write(path: string, content: string) { ops.push({ op: "write", arg: path }); files[path] = content; return {}; },
     async read(path: string) { ops.push({ op: "read", arg: path }); return path in files ? { content: files[path] } : { error: "not found" }; },
   };
@@ -45,23 +64,25 @@ async function run() {
     const resetIdx = ops.findIndex((o) => o.op === "exec" && o.arg.includes("rm -rf") && o.arg.includes(MOUNT_DIR));
     ok("resets ONLY the mount dir before building", resetIdx === 1, JSON.stringify(ops[resetIdx])); // after the initial marker read
 
-    const writes = ops.filter((o) => o.op === "write").map((o) => o.arg);
-    ok("artifact SKILL.md pushed under mount dir", writes.includes(join(MOUNT_DIR, "triage/SKILL.md")), JSON.stringify(writes));
-    ok("artifact helper.txt pushed under mount dir", writes.includes(join(MOUNT_DIR, "triage/helper.txt")));
+    // Skill files land as RAW bytes (base64-over-exec), decoded into MOUNT_DIR — assert on the
+    // reconstructed file tree, not on write ops (only the marker uses write now).
+    ok("artifact SKILL.md pushed under mount dir", files[join(MOUNT_DIR, "triage/SKILL.md")] === "# Triage (app)\n", JSON.stringify(Object.keys(files)));
+    ok("artifact helper.txt pushed under mount dir", files[join(MOUNT_DIR, "triage/helper.txt")] === "app-helper\n");
 
-    // App writes happen BEFORE the source cp (app wins collisions).
-    const lastArtifactWrite = ops.map((o) => o.op === "write" && o.arg.startsWith(MOUNT_DIR) && o.arg !== join(MOUNT_DIR, ".oc-mount")).lastIndexOf(true);
+    // App writes happen BEFORE the source cp (app wins collisions). The artifact "write" is the
+    // `base64 -d … > MOUNT/…` decode exec; the source copy is the `cp -Rpn` exec.
+    const lastArtifactWrite = ops.map((o) => o.op === "exec" && /^base64 -d /.test(o.arg) && o.arg.includes(MOUNT_DIR)).lastIndexOf(true);
     const srcCp = ops.findIndex((o) => o.op === "exec" && o.arg.includes("/workspace/sources/repo/.agents/skills"));
-    ok("artifact writes precede source copy (app wins)", lastArtifactWrite < srcCp, `artifactWrite@${lastArtifactWrite} cp@${srcCp}`);
-    ok("source copy uses no-clobber (cp -Rn)", ops[srcCp]?.arg.includes("cp -Rn"), ops[srcCp]?.arg);
+    ok("artifact writes precede source copy (app wins)", lastArtifactWrite >= 0 && lastArtifactWrite < srcCp, `artifactWrite@${lastArtifactWrite} cp@${srcCp}`);
+    ok("source copy uses no-clobber + mode-preserve (cp -Rpn)", ops[srcCp]?.arg.includes("cp -Rpn"), ops[srcCp]?.arg);
 
-    // NEVER write inside sources/<repo>: no write op targets it; the cp DESTINATION is always
-    // the mount dir (sources appear only as the read-only cp source `<src>/.agents/skills/.`).
-    const wroteIntoSource = ops.some((o) => o.op === "write" && o.arg.startsWith("/workspace/sources/"));
-    const cpDestNotMount = ops.some((o) => o.op === "exec" && o.arg.includes("cp -Rn") && !o.arg.includes(`${MOUNT_DIR}/'`));
+    // NEVER write inside sources/<repo>: no write/decode op targets it; the cp DESTINATION is
+    // always the mount dir (sources appear only as the read-only cp source `<src>/.agents/skills/.`).
+    const wroteIntoSource = ops.some((o) => (o.op === "write" || (o.op === "exec" && /^base64 -d /.test(o.arg))) && o.arg.includes("/workspace/sources/"));
+    const cpDestNotMount = ops.some((o) => o.op === "exec" && o.arg.includes("cp -Rpn") && !o.arg.includes(`${MOUNT_DIR}/'`));
     ok("never writes into sources/<repo>",
       !wroteIntoSource && !cpDestNotMount && !Object.keys(files).some((f) => f.startsWith("/workspace/sources/")),
-      JSON.stringify({ writes: ops.filter((o) => o.op === "write").map((o) => o.arg), files: Object.keys(files) }));
+      JSON.stringify({ ops: ops.map((o) => o.arg), files: Object.keys(files) }));
 
     ok("marker written last with the marker value", files[join(MOUNT_DIR, ".oc-mount")] === marker);
   }
