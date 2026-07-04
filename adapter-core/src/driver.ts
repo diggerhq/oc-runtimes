@@ -335,7 +335,7 @@ export function runAdapter(spec: RuntimeSpec): void {
     // Fetch by digest in TWO steps so the turn token never reaches R2: (1) ask the control plane
     // (with X-Turn-Token) for a short-lived signed URL — it verifies the digest against the session
     // snapshot; (2) download the bundle from that URL with NO auth header (the signed URL is
-    // self-authenticating). materializeBundle re-verifies the fileset digest before swapping.
+    // self-authenticating). materializeBundle re-verifies the blob digest (sha256 of the .tar.gz) before swapping.
     const metaUrl = `${config.apiUrl}/v3/sessions/${config.sessionId}/skill-bundle?digest=${encodeURIComponent(skillBundleDigest)}&mode=url`;
     const meta = await fetch(metaUrl, { headers: { "X-Turn-Token": config.turnToken } });
     if (!meta.ok) throw new Error(`skill-bundle ${meta.status}: ${await meta.text().catch(() => "")}`);
@@ -350,11 +350,11 @@ export function runAdapter(spec: RuntimeSpec): void {
 
   /**
    * Materialize the session's pinned FRAMEWORK ARTIFACT (design 012 §11.5/§11.6) — the exact
-   * skill-bundle mechanism reused verbatim (same tar.gz + fileset digest, materializeBundle),
+   * skill-bundle mechanism reused verbatim (same tar.gz + blob digest, materializeBundle),
    * with the artifact's own paths (contract 6): versioned unpack under
    * `<stateDir>/artifact-versions/<digest>/`, atomic symlink `<stateDir>/artifact` → it; the
    * launcher reads `<stateDir>/artifact/artifact.json`. Two-step signed-URL fetch (contract 2)
-   * so the turn token never reaches R2; materializeBundle re-verifies the fileset digest.
+   * so the turn token never reaches R2; materializeBundle re-verifies the blob digest.
    * Returns true when the live target CHANGED (caller restarts the resident brain). No-op for
    * runtimes without OC_FRAMEWORK_ARTIFACT_DIGEST. Throws → the caller fails the turn.
    */
