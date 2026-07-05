@@ -63,4 +63,6 @@ The tailer (W2) wakes and pulls `view=updates` until the submission settles. Bes
 
 **Interpretation:** account-wide counting → per-account agent ceiling = `500 / (agents-per-app + workflows-per-app + 1 registry)` → shard tenants across accounts (a pool of WfP accounts, agent→account map). Per-script (isolated) → single-account tenancy is fine. Report the number into the working doc's Open-decisions.
 
-> Not executed in this build pass (context budget + live-account caution). The dispatch Worker + composer — the net-new W5 code — are complete and tested; the experiment above is the isolated remaining step, safe to run in a fresh context with the guardrails above.
+**Harness read-only-validated (2026-07-05):** the CF creds in `sessions-api/.env.v3` work against Mo's account `b8f23c…`; the account has exactly **one** dispatch namespace — `opencomputer-agent` (prod, ~336 scripts — **never touch**). So the experiment must **create** a fresh throwaway ns (e.g. `oc-flue-500test`) for steps 1–4. Starting state confirmed; the deploy/count/teardown mutations are the remaining run.
+
+> Only the read-only probe (namespace list) was run this pass — no mutations, no deploys (live-account caution + context budget). The dispatch Worker + composer — the net-new W5 code — are complete and tested; the deploy-count-teardown experiment is the isolated remaining step, safe to run in a fresh context with the guardrails above.
