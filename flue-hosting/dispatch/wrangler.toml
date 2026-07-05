@@ -1,0 +1,17 @@
+name = "flue-dispatch"
+main = "src/index.ts"
+compatibility_date = "2026-04-01"
+compatibility_flags = ["nodejs_compat"]
+
+# The Workers-for-Platforms dispatch namespace binding. Set the namespace name on deploy; for the
+# W5 live checks use a THROWAWAY namespace (never the prod `opencomputer-agent` ns).
+[[dispatch_namespaces]]
+binding = "DISPATCHER"
+namespace = "oc-flue-throwaway"   # override per environment; NEVER opencomputer-agent
+
+# Secrets (wrangler secret put — never in this file):
+#   INTERNAL_AUTH_SECRET  — control-plane (sessions-api) auth for admits + the tailer kick
+#   CLIENT_TOKEN_SECRET   — session-scoped client token verification (dashboard/direct), HS256
+[vars]
+# SESSIONS_API_URL — default https://api.opencomputer.dev; override for dev.
+# KICK_PATH        — default /internal/flue/kick

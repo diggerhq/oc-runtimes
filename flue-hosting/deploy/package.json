@@ -1,0 +1,8 @@
+{
+  "name": "flue-deploy",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": { "typecheck": "tsc --noEmit", "test": "vitest run" },
+  "devDependencies": { "typescript": "^5.5.0", "vitest": "^2.0.0", "@types/node": "^20" }
+}
