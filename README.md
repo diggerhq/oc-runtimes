@@ -1,15 +1,33 @@
 # oc-runtimes
 
-Runtime images for OpenComputer Durable Agent Sessions. This repo is the source of truth
-for runtime code; `sessions-api` holds the host only. Full contract spec: design 011
-(§11 contracts, §12 journeys).
+**The agent runtimes behind [OpenComputer Durable Agent Sessions](https://docs.opencomputer.dev/agent-sessions/overview).**
+
+Durable Agent Sessions let you define an agent once and run **resumable, steerable** sessions against
+it: the runtime restarts on crash, hibernates when idle (storage-only billing while asleep), and streams
+a durable event log you can steer with messages and collect results from by webhook. **This repo is the
+runtime layer** — the code that actually drives each turn inside a session's sandbox. The host (session
+lifecycle, events API, leases, billing) lives in `sessions-api`; the product you point at it — dashboard,
+REST API, SDKs — is [OpenComputer](https://app.opencomputer.dev).
+
+- 📚 **Docs:** [Durable Agent Sessions overview](https://docs.opencomputer.dev/agent-sessions/overview) · [Quickstart](https://docs.opencomputer.dev/agent-sessions/quickstart) · [Custom runtimes](https://docs.opencomputer.dev/agent-sessions/custom-runtimes)
+- 🖥️ **Dashboard:** [app.opencomputer.dev](https://app.opencomputer.dev)
+- 📐 **Contract spec (internal):** design 011 (§11 contracts, §12 journeys)
+
+A **runtime** is the "brain" of a session — it wraps a model or agent SDK behind one uniform contract, so
+the host runs any of them the same way: one process per turn, resumable across crashes and hibernation,
+with tool calls proxied to a separate sandbox. This repo is the **source of truth for runtime code**;
+`sessions-api` holds only the host that invokes it.
 
 ```
-adapter-core/   @oc/adapter-core      shared per-turn driver (runAdapter + RuntimeSpec)
-claude/         @oc/runtime-claude    Claude Agent SDK brain
-codex/          @oc/runtime-codex     Codex SDK brain
-pi/             @oc/runtime-pi        pi coding agent brain (earendil-works/pi, MIT)
+adapter-core/       @oc/adapter-core     shared per-turn driver (runAdapter + RuntimeSpec)
+claude/             @oc/runtime-claude   Claude Agent SDK brain
+codex/              @oc/runtime-codex    OpenAI Codex SDK brain
+pi/                 @oc/runtime-pi       pi coding-agent brain (earendil-works/pi, MIT)
+flue/               @oc/runtime-flue     hosts a user-built Flue artifact as a brain (design 012 §11.6)
+opencomputer-flue/  @opencomputer/flue   the serveOC package a Flue artifact's entry calls
 ```
+
+> **Building your own runtime?** Start with the human-facing [Custom runtimes guide](https://docs.opencomputer.dev/agent-sessions/custom-runtimes), then use `claude/` or `pi/` here as a working template. A runtime is a `RuntimeSpec` (seven knobs) plus a brain server — see **Contracts** below.
 
 ## How it works
 
@@ -34,6 +52,21 @@ adapter's MCP host; the host proxies to hands and emits the tool events
 (`tool.call`/`exec.completed`/`agent.message`) itself — the brain's stream never carries
 them. Tools are valid only while a `/turn` is in flight; the MCP host dies with the
 adapter.
+
+## The runtimes
+
+- **`adapter-core`** (`@oc/adapter-core`) — the shared per-turn driver. `runAdapter(spec)` is the whole
+  adapter; a runtime supplies a `RuntimeSpec`. Content-addresses skill/artifact bundles by blob digest
+  and extracts with the system tar. Every runtime is a `file:` dep on it (build it first — see Dev).
+- **`claude` / `codex` / `pi`** (`@oc/runtime-claude` / `-codex` / `-pi`) — model/agent SDK brains. Same
+  shape: a `RuntimeSpec` + a resident brain server. Use one as your template.
+- **`flue`** (`@oc/runtime-flue`) — hosts a **user-built Flue artifact** (a self-contained ESM bundle) as
+  an OC brain, instead of a baked-in SDK. Ships only the adapter-side consumer — a `RuntimeSpec`
+  (FlueEvent → OC taxonomy translation, MCP subset, sources note), a launcher that resolves + imports the
+  materialized artifact, and the aggregated skills-mount helper. It never links `@flue/runtime`: it knows
+  Flue's wire shapes, not its code, so it hosts whichever artifact lands in it (design 012 §11.6).
+- **`opencomputer-flue`** (`@opencomputer/flue`) — the `serveOC(agent)` package a Flue app's entry calls to
+  become that resident brain.
 
 ## Contracts
 
@@ -67,18 +100,18 @@ silently eats deliveries (the watches API has no per-runtime gate).
 ```sh
 # order matters: runtimes are file:-deps on adapter-core; their tsc needs its dist
 cd adapter-core && npm install && npm run build && npm test
-cd ../claude && npm install && npm run typecheck && npm run build   # same for codex, pi
+cd ../claude && npm install && npm run typecheck && npm run build   # same for codex, pi, flue
 ```
 
-- Node ≥ 20 for claude/codex; **pi needs ≥ 22.19** (its SDK) — locally too. Snapshots bake
-  node22 into the pi image; its entrypoint is `node22/bin/node dist/adapter.js`.
+- Node ≥ 20 for claude/codex; **pi and flue need ≥ 22.19** (their SDKs) — locally too. Snapshots bake
+  node22 into those images; the entrypoint is `node22/bin/node dist/adapter.js`.
 - After touching `adapter-core/src`, rebuild it before typechecking consumers. A stale
   `adapter-core/dist` compiles clean and lies.
 - Model calls MUST honor proxy env (`HTTPS_PROXY` + `NODE_EXTRA_CA_CERTS`): the sealed API
   key in the box is a placeholder the egress proxy swaps on the way out. Node's built-in
   fetch ignores proxy env — pi's server routes global fetch through undici's
   `EnvHttpProxyAgent` for exactly this reason. A brain that bypasses the proxy gets
-  provider 401s (and no Managed billing).
+  provider 401s (and no managed billing).
 - Keep the tree clean when snapshots build from your checkout: the pipeline refuses a
   dirty tree (build rows stamp `source_ref = oc-runtimes@<sha>`).
 
@@ -93,3 +126,7 @@ import-resolves in-image), publishes to the shared catalog, records the build ro
 Versions are immutable — bump the runtime's `package.json` to rebuild. Activation is
 separate: owner-scoped pointer pin for canary, global pointer flip to promote, flip back
 to roll back. New sessions resolve pointers at create; in-flight sessions keep their pin.
+
+---
+
+Part of [OpenComputer](https://opencomputer.dev) — durable sandboxes for AI agents.
