@@ -7,7 +7,15 @@ Two pieces (each independently tested, in-process, no live CF needed for CI):
 | Dir | What | Tests |
 |---|---|---|
 | `dispatch/` | the dispatch Worker — auth boundary + byte-exact forward + tailer kick | 7 ✓ |
-| `deploy/` | the contract-#4 wrangler composer — synthesizes the migration ledger + OC bindings | 10 ✓ |
+| `deploy/` | the contract-#4 wrangler composer (`compose-wrangler.ts`) + the multipart WfP script-upload deploy step (`wfp-deploy.ts`) — synthesizes the migration ledger + OC bindings, then uploads them so `migrations` land on the script | 23 ✓ |
+
+> ## ⛔ NEVER `wrangler deploy` a tenant
+> `wrangler deploy --dispatch-namespace <ns>` **silently drops the Durable Object migrations** — the
+> uploaded script lands with `migrations: null`, so its SQLite-backed DO 500s at runtime with
+> **"SQL is not enabled"** (surfaced by the W6 live run, 2026-07-07). Wrangler is NOT a supported tenant
+> vehicle. The **only** supported path is the multipart Workers-for-Platforms script-upload API
+> (`deploy/src/wfp-deploy.ts` → `PUT …/dispatch/namespaces/{ns}/scripts/{name}`), which carries the
+> composed `migrations` (`new_sqlite_classes`) in the `metadata` part. This governs W5 **and W7**.
 
 ---
 
@@ -47,6 +55,17 @@ The tailer (W2) wakes and pulls `view=updates` until the submission settles. Bes
 - **enforces floors:** `compatibility_date ≥ 2026-04-01`, `nodejs_compat` (never downgrades a stricter user value).
 
 **Deploy rule:** upload **only** this composed config — never ship the generated `wrangler.json` alongside (wrangler would pick the empty-migration one → hard failure).
+
+## The deploy step (`deploy/src/wfp-deploy.ts`) — the multipart WfP upload
+
+The composer produces the config + ledger; **this step is what actually reaches Cloudflare**, and it MUST be the raw multipart script-upload — not `wrangler deploy` (see the ⛔ above; wrangler drops `migrations`). `deployTenantScript(cf, scriptName, composeResult, module, opts)`:
+
+- **`PUT https://api.cloudflare.com/client/v4/accounts/{acct}/workers/dispatch/namespaces/{ns}/scripts/{name}`** with a `multipart/form-data` body = a `metadata` JSON part + the ES-module part(s). `scriptName` = the OC agent id (`agt_…`); one script per agent.
+- **`metadata` part** carries `main_module`, `compatibility_date`/`compatibility_flags`, `bindings` (vars→`plain_text`, DO bindings→`durable_object_namespace`, secrets→`secret_text`), and — the whole point — **`migrations`** = a single WfP step derived by `migrationForUpload(composeResult)` from the composer's ledger: first deploy → `{new_tag:"v1", new_sqlite_classes:[…all classes]}`; adding an agent → `{old_tag:"v1", new_tag:"v2", new_sqlite_classes:[…new class only]}`; a behavior-only revision → `null` (nothing to migrate). This is where `new_sqlite_classes` lands on the script.
+- **The module part's filename must equal `metadata.main_module`.** The step uploads the already-bundled `flue build --target cloudflare` artifact verbatim — it does NOT bundle.
+- **Changed-migration re-apply is impossible in place** (WfP rejects it). Pass `{ recreate: true }` to delete+recreate the script and replay the FULL ledger as one fresh migration (design 013 §6.1, blue/green).
+
+W7's `oc deploy` composes then calls `deployTenantScript` (binding the minted `OC_SESSION_TOKEN` via `opts.secrets`). CF creds (`accountId`/`apiToken`) grep from `sessions-api/.env.v3` — never `source` it, never commit the token; upload only to a **throwaway** namespace, never the prod `opencomputer-agent` ns.
 
 ---
 

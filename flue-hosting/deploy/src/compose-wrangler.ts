@@ -5,6 +5,10 @@
 // append-never-reorder ledger synthesized from the emitted class names, adds OC bindings + floors,
 // and returns the single config to upload. The deploy step must upload ONLY this — never ship the
 // generated wrangler.json alongside (wrangler would pick the empty-migration one).
+//
+// The uploaded `migrations` reach the tenant script ONLY via the multipart WfP script-upload in
+// wfp-deploy.ts (`deployTenantScript`). NEVER `wrangler deploy --dispatch-namespace` — it silently
+// drops migrations (`migrations: null`) → the DO 500s "SQL is not enabled" (W6). See ../README.md.
 
 export interface WranglerDOBinding { name: string; class_name: string; script_name?: string }
 export interface MigrationEntry { tag: string; new_sqlite_classes?: string[]; deleted_classes?: string[] }
