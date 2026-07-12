@@ -9,9 +9,12 @@ compatibility_flags = ["nodejs_compat"]
 binding = "DISPATCHER"
 namespace = "oc-flue-throwaway"   # override per environment; NEVER opencomputer-agent
 
+[dispatch_namespaces.outbound]
+service = "flue-outbound"
+
 # Secrets (wrangler secret put — never in this file):
-#   INTERNAL_AUTH_SECRET  — control-plane (sessions-api) auth for admits + the tailer kick
-#   CLIENT_TOKEN_SECRET   — session-scoped client token verification (dashboard/direct), HS256
+#   DISPATCH_AUTH_SECRET  — dedicated sessions-api → dispatch bearer
+#   KICK_AUTH_SECRET      — dedicated dispatch → /internal/flue/kick bearer
 [vars]
 # SESSIONS_API_URL — default https://api.opencomputer.dev; override for dev.
 # KICK_PATH        — default /internal/flue/kick
