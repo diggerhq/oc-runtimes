@@ -34,6 +34,11 @@ POST  https://<dispatch-worker>/dispatch/<agt_id>/agents/<agent_name>/<ses_id>
 - **Byte-exact:** the dispatch Worker strips `/dispatch/<agt_id>`, so the tenant Worker receives **exactly** `POST /agents/<agent_name>/<ses_id>` with the same body/query (host constraint 1 — the DO parses exact path tails; any transform silently terminalizes lost submissions). All tenant tails work the same way: `…/abort`, `…/attachments/<id>`, `GET …?view=updates` (stream read), `POST /workflows/:name`, `GET /runs/:runId`, `ALL /channels/:name`.
 - **Auth boundary (B5):** verified **before** any forward. Only the dedicated `X-Flue-Dispatch-Auth` control-plane bearer is accepted; browser client tokens terminate at sessions-api, which performs grant/scope/revocation checks and dispatches internally. Tenant scripts have no other route (no workers.dev, no custom domain). The control header is stripped before the tenant sees the request. W9 adds provider-authenticated channel ingress as an explicit route class.
 
+**Preview egress:** the namespace outbound Worker allows only Flue's exact synthetic hosts plus the
+comma-separated platform hosts configured in its own `MANAGED_EGRESS_HOSTS`. It does not fetch a
+per-agent policy, so model calls have no sessions-api dependency. Tenant-configurable allowlists are
+deferred until external tenants need them.
+
 ## The tailer kick (W5 → W1/W2 seam)
 
 On every **inbound admit** (a `POST` to exactly `/agents/<name>/<ses>` — not stream reads, aborts, or attachment tails), the dispatch Worker fires, via `waitUntil`:

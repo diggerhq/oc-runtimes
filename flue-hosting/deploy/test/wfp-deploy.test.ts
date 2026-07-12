@@ -13,8 +13,6 @@ import {
   buildFormData,
   deployTenantScript,
   deleteTenantScript,
-  putTenantSecret,
-  deleteTenantSecret,
   WfpDeployError,
   type WfpMetadata,
   type ScriptModule,
@@ -165,53 +163,5 @@ describe("deployTenantScript (injected fetch — no live CF)", () => {
   it("deleteTenantScript treats a 404 as already-gone (no throw)", async () => {
     const fetchImpl = (async () => new Response("", { status: 404 })) as unknown as typeof fetch;
     await expect(deleteTenantScript(cf, "agt_gone", fetchImpl)).resolves.toBeUndefined();
-  });
-});
-
-describe("tenant secret bindings (injected fetch — no live CF)", () => {
-  it("updates a live script through the WfP secret endpoint", async () => {
-    let captured: { url: string; method?: string; auth: string | null; body: unknown } | null = null;
-    const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
-      captured = {
-        url: String(url), method: init?.method,
-        auth: new Headers(init?.headers).get("authorization"),
-        body: JSON.parse(String(init?.body)),
-      };
-      return okEnvelope();
-    }) as unknown as typeof fetch;
-
-    await expect(putTenantSecret(cf, "agt_123", "LINEAR_TOKEN", "secret-value", fetchImpl)).resolves.toBe("synced");
-    expect(captured).toEqual({
-      url: "https://cf.test/v4/accounts/acct_1/workers/dispatch/namespaces/oc-flue-throwaway/scripts/agt_123/secrets",
-      method: "PUT", auth: "Bearer cf-token",
-      body: { name: "LINEAR_TOKEN", type: "secret_text", text: "secret-value" },
-    });
-  });
-
-  it("deletes an encoded binding and treats a missing script as pending deploy", async () => {
-    const calls: string[] = [];
-    const fetchImpl = (async (url: string | URL | Request) => {
-      calls.push(String(url));
-      return new Response("", { status: 404 });
-    }) as unknown as typeof fetch;
-
-    await expect(deleteTenantSecret(cf, "agt_123", "TOKEN/OLD", fetchImpl)).resolves.toBe("script_not_found");
-    await expect(putTenantSecret(cf, "agt_123", "TOKEN", "value", fetchImpl)).resolves.toBe("script_not_found");
-    expect(calls[0]).toContain("/secrets/TOKEN%2FOLD");
-  });
-
-  it("reports provider errors without leaking credentials or secret values", async () => {
-    const fetchImpl = (async () =>
-      new Response(JSON.stringify({ success: false, errors: [{ message: "denied" }] }), { status: 403 })
-    ) as unknown as typeof fetch;
-    let message = "";
-    try {
-      await putTenantSecret(cf, "agt_123", "TOKEN", "super-secret-value", fetchImpl);
-    } catch (error) {
-      message = String((error as Error).message);
-    }
-    expect(message).toContain("denied");
-    expect(message).not.toContain("cf-token");
-    expect(message).not.toContain("super-secret-value");
   });
 });

@@ -95,12 +95,9 @@ export default {
 
     let resp: Response;
     try {
-      // The outbound Worker receives only the agent id; it resolves the live allowlist over its
-      // dedicated read-only policy seam. No user config or secret is trusted from this request.
-      const tenant = env.DISPATCHER.get(p.script, {}, {
-        outbound: { policy: { agent_id: p.script } },
-      });
-      resp = await tenant.fetch(fwdReq);
+      // The namespace's outbound Worker has a static platform-managed host set. It needs no
+      // per-request tenant parameters and cannot make the model hot path depend on sessions-api.
+      resp = await env.DISPATCHER.get(p.script).fetch(fwdReq);
     } catch (err) {
       // WfP `get()` throws if the script doesn't exist in the namespace → a clear 404 for the caller.
       const msg = err instanceof Error ? err.message : String(err);

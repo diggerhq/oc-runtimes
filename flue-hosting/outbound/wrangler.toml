@@ -4,9 +4,6 @@ compatibility_date = "2026-04-01"
 compatibility_flags = ["nodejs_compat"]
 
 [vars]
-EGRESS_POLICY_URL = "https://api.opencomputer.dev/internal/flue/egress-policy"
-# Include the deployed gateway host and platform APIs in production.
+# Exact hosts only. Before binding this Worker, include the hostname from V3_FLUE_GATEWAY_URL plus
+# each managed OC API the tenant runtime calls. Tenant-configurable egress is deferred past preview.
 MANAGED_EGRESS_HOSTS = "api.opencomputer.dev,app.opencomputer.dev"
-
-# Secret (wrangler secret put; never in this file):
-#   EGRESS_POLICY_SECRET — dedicated read-only bearer shared with sessions-api

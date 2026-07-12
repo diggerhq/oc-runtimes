@@ -11,7 +11,6 @@ namespace = "oc-flue-throwaway"   # override per environment; NEVER opencomputer
 
 [dispatch_namespaces.outbound]
 service = "flue-outbound"
-parameters = ["policy"]
 
 # Secrets (wrangler secret put — never in this file):
 #   DISPATCH_AUTH_SECRET  — dedicated sessions-api → dispatch bearer
