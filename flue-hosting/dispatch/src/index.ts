@@ -4,8 +4,8 @@
 // Tenant scripts (stock `flue build --target cloudflare` Workers) have NO other route — no
 // workers.dev, no custom domain. Every request reaches them ONLY through this Worker, which:
 //   1. selects the tenant script from the URL prefix (= the OC agent's `agt_` id);
-//   2. verifies the caller (control-plane internal-auth, or a session-scoped client token) BEFORE
-//      forwarding — a user's own app.ts may add no auth, so the platform owns it (B5);
+//   2. verifies the dedicated control-plane dispatch bearer BEFORE forwarding — browser client
+//      tokens terminate at the sessions API, so this Worker is not a second public session API;
 //   3. forwards the remainder of the path BYTE-EXACT via env.DISPATCHER.get(script).fetch(req)
 //      (host constraint 1: the DO parses exact path tails; any transform silently terminalizes
 //      lost submissions);
@@ -24,8 +24,8 @@
 
 export interface Env {
   DISPATCHER: DispatchNamespace;
-  INTERNAL_AUTH_SECRET: string;        // control-plane (sessions-api) auth
-  CLIENT_TOKEN_SECRET?: string;        // session-scoped client token (dashboard/direct) — HS256
+  DISPATCH_AUTH_SECRET: string;        // dedicated sessions-api → dispatch bearer
+  KICK_AUTH_SECRET: string;            // dedicated dispatch → /internal/flue/kick bearer
   SESSIONS_API_URL?: string;           // for the tailer kick; default = prod
   KICK_PATH?: string;                  // default /internal/flue/kick
 }
@@ -41,31 +41,6 @@ function timingSafeEqual(a: string, b: string): boolean {
   let diff = 0;
   for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
   return diff === 0;
-}
-
-// Minimal HS256 verify (Web Crypto) for the session-scoped client token — same alg as sessions-api's
-// client token (auth/client.ts, jose HS256). Returns the claims or null. Kept dependency-free.
-async function verifyClientToken(secret: string, token: string, nowSec: number): Promise<{ sub?: string; session?: string } | null> {
-  const parts = token.split(".");
-  if (parts.length !== 3) return null;
-  const [h, p, s] = parts;
-  const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["verify"]);
-  const b64urlToBytes = (x: string) => {
-    const pad = x.length % 4 === 0 ? "" : "=".repeat(4 - (x.length % 4));
-    const bin = atob(x.replace(/-/g, "+").replace(/_/g, "/") + pad);
-    const out = new Uint8Array(bin.length);
-    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-    return out;
-  };
-  let ok: boolean;
-  try { ok = await crypto.subtle.verify("HMAC", key, b64urlToBytes(s), new TextEncoder().encode(`${h}.${p}`)); }
-  catch { return null; }
-  if (!ok) return null;
-  try {
-    const claims = JSON.parse(new TextDecoder().decode(b64urlToBytes(p))) as { exp?: number; sub?: string; session?: string; sid?: string };
-    if (typeof claims.exp === "number" && claims.exp <= nowSec) return null;
-    return { sub: claims.sub, session: claims.session ?? claims.sid ?? claims.sub };
-  } catch { return null; }
 }
 
 interface Parsed { script: string; tenantPath: string; sessionId: string | null; isAdmit: boolean; isChannel: boolean }
@@ -98,18 +73,9 @@ export default {
     if (!p) return json({ error: { type: "not_found", message: "expected /dispatch/<script>/…" } }, 404);
 
     // ── auth boundary (B5): verify BEFORE any forward ──────────────────────────────
-    const internal = req.headers.get("x-internal-auth");
-    const isControlPlane = !!internal && timingSafeEqual(internal, env.INTERNAL_AUTH_SECRET);
-    if (!isControlPlane) {
-      // External caller (dashboard/direct): require a session-scoped client token that matches the
-      // ses_ in the path (no cross-session reach). Channels (W9) carry their own signature — deferred.
-      const auth = req.headers.get("authorization");
-      const token = auth && /^Bearer\s+/i.test(auth) ? auth.replace(/^Bearer\s+/i, "").trim() : null;
-      const claims = token && env.CLIENT_TOKEN_SECRET ? await verifyClientToken(env.CLIENT_TOKEN_SECRET, token, Math.floor(Date.now() / 1000)) : null;
-      const sessionOk = claims && p.sessionId && claims.session === p.sessionId;
-      if (!sessionOk) {
-        return json({ error: { type: "unauthorized", message: "dispatch requires internal auth or a matching session client token" } }, 401);
-      }
+    const presented = req.headers.get("x-flue-dispatch-auth");
+    if (!presented || !timingSafeEqual(presented, env.DISPATCH_AUTH_SECRET)) {
+      return json({ error: { type: "unauthorized", message: "dispatch requires control-plane auth" } }, 401);
     }
 
     // ── byte-exact forward into the tenant script ──────────────────────────────────
@@ -118,7 +84,9 @@ export default {
     const tenantUrl = new URL(req.url);
     tenantUrl.pathname = p.tenantPath;
     const fwdHeaders = new Headers(req.headers);
-    fwdHeaders.delete("x-internal-auth");
+    fwdHeaders.delete("x-flue-dispatch-auth");
+    const deferKick = fwdHeaders.get("x-flue-defer-kick") === "1";
+    fwdHeaders.delete("x-flue-defer-kick");
     // `duplex: "half"` is required by undici (node/tests) when forwarding a streaming body; the
     // Workers runtime accepts it too. GET/HEAD have a null body → no duplex needed.
     const init: RequestInit = { method: req.method, headers: fwdHeaders, body: req.body, redirect: "manual" };
@@ -127,7 +95,12 @@ export default {
 
     let resp: Response;
     try {
-      resp = await env.DISPATCHER.get(p.script).fetch(fwdReq);
+      // The outbound Worker receives only the agent id; it resolves the live allowlist over its
+      // dedicated read-only policy seam. No user config or secret is trusted from this request.
+      const tenant = env.DISPATCHER.get(p.script, {}, {
+        outbound: { policy: { agent_id: p.script } },
+      });
+      resp = await tenant.fetch(fwdReq);
     } catch (err) {
       // WfP `get()` throws if the script doesn't exist in the namespace → a clear 404 for the caller.
       const msg = err instanceof Error ? err.message : String(err);
@@ -135,22 +108,24 @@ export default {
     }
 
     // ── tailer kick on a successful inbound admit (W5 → W1/W2) ──────────────────────
-    if (p.isAdmit && p.sessionId && resp.status < 300) {
-      ctx.waitUntil(kickTailer(env, p.sessionId));
+    if (p.isAdmit && p.sessionId && resp.status < 300 && !deferKick) {
+      ctx.waitUntil(kickAdmittedTailer(env, p.sessionId, resp.clone()));
     }
 
     return resp;
   },
 };
 
-async function kickTailer(env: Env, sessionId: string): Promise<void> {
+async function kickAdmittedTailer(env: Env, sessionId: string, admission: Response): Promise<void> {
   try {
+    const body = (await admission.json().catch(() => ({}))) as Record<string, unknown>;
+    const submissionId = typeof body.submissionId === "string" ? body.submissionId : undefined;
     const base = env.SESSIONS_API_URL || DEFAULT_SESSIONS_API;
     const path = env.KICK_PATH || "/internal/flue/kick";
     await fetch(base + path, {
       method: "POST",
-      headers: { "content-type": "application/json", "x-internal-auth": env.INTERNAL_AUTH_SECRET },
-      body: JSON.stringify({ session_id: sessionId }),
+      headers: { "content-type": "application/json", "x-flue-kick-auth": env.KICK_AUTH_SECRET },
+      body: JSON.stringify({ session_id: sessionId, ...(submissionId ? { submission_id: submissionId } : {}) }),
     });
   } catch {
     // Best-effort: a missed kick is recovered by the tailer's poll fallback (W2). Never fail the turn.

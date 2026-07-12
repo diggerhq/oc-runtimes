@@ -162,6 +162,50 @@ async function readEnvelope(res: Response): Promise<CfEnvelope> {
   try { return (await res.json()) as CfEnvelope; } catch { return {}; }
 }
 
+export type TenantSecretSync = "synced" | "script_not_found";
+
+/** Add/replace one secret binding without re-uploading the tenant bundle. */
+export async function putTenantSecret(
+  cf: CfCreds,
+  scriptName: string,
+  name: string,
+  value: string,
+  fetchImpl: typeof fetch = fetch,
+): Promise<TenantSecretSync> {
+  const res = await fetchImpl(`${scriptUrl(cf, scriptName)}/secrets`, {
+    method: "PUT",
+    headers: { authorization: `Bearer ${cf.apiToken}`, "content-type": "application/json" },
+    body: JSON.stringify({ name, type: "secret_text", text: value }),
+  });
+  if (res.status === 404) return "script_not_found";
+  const env = await readEnvelope(res);
+  if (!res.ok || env.success === false) {
+    const detail = env.errors?.map((e) => e.message).join("; ") || res.statusText;
+    throw new WfpDeployError(`WfP secret update '${scriptName}/${name}' failed (${res.status}): ${detail}`);
+  }
+  return "synced";
+}
+
+/** Remove one secret binding from an already-live tenant script. */
+export async function deleteTenantSecret(
+  cf: CfCreds,
+  scriptName: string,
+  name: string,
+  fetchImpl: typeof fetch = fetch,
+): Promise<TenantSecretSync> {
+  const res = await fetchImpl(`${scriptUrl(cf, scriptName)}/secrets/${encodeURIComponent(name)}`, {
+    method: "DELETE",
+    headers: { authorization: `Bearer ${cf.apiToken}` },
+  });
+  if (res.status === 404) return "script_not_found";
+  const env = await readEnvelope(res);
+  if (!res.ok || env.success === false) {
+    const detail = env.errors?.map((e) => e.message).join("; ") || res.statusText;
+    throw new WfpDeployError(`WfP secret delete '${scriptName}/${name}' failed (${res.status}): ${detail}`);
+  }
+  return "synced";
+}
+
 /** Delete a tenant script (the delete half of the delete+recreate path). Idempotent-ish: a 404 is fine. */
 export async function deleteTenantScript(cf: CfCreds, scriptName: string, fetchImpl: typeof fetch = fetch): Promise<void> {
   const res = await fetchImpl(`${scriptUrl(cf, scriptName)}?force=true`, {
