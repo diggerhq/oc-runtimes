@@ -1,0 +1,24 @@
+name = "oc-agent-dispatch-local"
+main = "src/index.ts"
+compatibility_date = "2026-04-01"
+compatibility_flags = ["nodejs_compat"]
+workers_dev = false
+
+# Production is deliberately available only through `npm run deploy:production`.
+[env.production]
+name = "oc-agent-dispatch-prod"
+workers_dev = true
+
+[[env.production.dispatch_namespaces]]
+binding = "DISPATCHER"
+namespace = "oc-agent-workers-prod"
+
+[env.production.dispatch_namespaces.outbound]
+service = "oc-agent-egress-prod"
+
+# Secrets (wrangler secret put — never in this file):
+#   AGENT_DISPATCH_AUTH_SECRET — dedicated sessions-api → dispatch bearer
+#   FLUE_KICK_AUTH_SECRET      — dedicated dispatch → /internal/flue/kick bearer
+[env.production.vars]
+SESSIONS_API_URL = "https://api.opencomputer.dev"
+KICK_PATH = "/internal/flue/kick"

@@ -5,7 +5,7 @@ const env = (hosts = "gateway.oc.test,api.oc.test"): Env => ({ MANAGED_EGRESS_HO
 
 afterEach(() => vi.restoreAllMocks());
 
-describe("Flue outbound Worker", () => {
+describe("agent egress Worker", () => {
   it("allows exact platform-managed hosts without a policy lookup", async () => {
     const fetch = vi.fn(async () => new Response("upstream-ok"));
     vi.stubGlobal("fetch", fetch);
