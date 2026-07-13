@@ -1,4 +1,4 @@
-// Preview egress boundary for WfP tenant Workers. It has no tenant policy fetch and therefore no
+// Managed egress boundary for WfP tenant Workers. It has no tenant policy fetch and therefore no
 // control-plane availability dependency: platform operators configure the small exact set of
 // managed hosts the runtime needs (gateway, ingest, sandbox/repo API) on this Worker itself.
 

@@ -13,10 +13,15 @@
 // `bindings` (incl. the `durable_object_namespace` bindings), `compatibility_*`, and — critically —
 // the `migrations` object synthesized by the composer's append-never-reorder ledger.
 
-import type { ComposeResult, GeneratedWrangler, MigrationEntry } from "./compose-wrangler.js";
+import type {
+  ComposeResult,
+  MigrationEntry,
+  TenantScriptConfig,
+} from "./adapters/flue/compose-wrangler.js";
 
 const DEFAULT_API_BASE = "https://api.cloudflare.com/client/v4";
 const MODULE_CONTENT_TYPE = "application/javascript+module";
+const AGENT_ID = /^agt_[0-9a-f]{24}$/;
 
 /** A single WfP migration step (the shape the script-upload `metadata.migrations` field accepts). */
 export interface SingleStepMigration {
@@ -29,7 +34,7 @@ export interface SingleStepMigration {
 export type WfpBinding =
   | { type: "plain_text"; name: string; text: string }
   | { type: "secret_text"; name: string; text: string }
-  | { type: "durable_object_namespace"; name: string; class_name: string; script_name?: string };
+  | { type: "durable_object_namespace"; name: string; class_name: string };
 
 /** The `metadata` part of the multipart upload. */
 export interface WfpMetadata {
@@ -58,7 +63,7 @@ export interface CfCreds {
 export interface DeployOptions {
   /** Extra secret bindings (uploaded as `secret_text` — e.g. `OC_SESSION_TOKEN`). Override same-named vars. */
   secrets?: Record<string, string>;
-  /** Extra ES modules besides the entry (chunks/sourcemaps), if the build emits them. */
+  /** Extra verified .js/.mjs modules besides the entry. */
   additionalModules?: ScriptModule[];
   /** Re-applying a CHANGED migration is impossible in place — WfP rejects it. Set to delete+recreate
    *  the script and replay the FULL ledger as one fresh migration (design 013 §6.1, blue/green). */
@@ -68,6 +73,22 @@ export interface DeployOptions {
 }
 
 export class WfpDeployError extends Error {}
+
+function assertAgentScriptName(scriptName: string): void {
+  if (!AGENT_ID.test(scriptName)) {
+    throw new WfpDeployError("WfP script name must be a canonical OpenComputer agent id");
+  }
+}
+
+function assertModule(module: ScriptModule): void {
+  const path = module.filename;
+  const segments = path.split("/");
+  if (!path || path.startsWith("/") || path.includes("\\")
+    || !(path.endsWith(".js") || path.endsWith(".mjs"))
+    || segments.some((segment) => segment === "" || segment === "." || segment === "..")) {
+    throw new WfpDeployError("tenant modules must use safe relative .js/.mjs paths");
+  }
+}
 
 /** Flatten the append-only ledger into every SQLite class it has ever introduced (first-seen order). */
 function allLedgerClasses(ledger: MigrationEntry[]): string[] {
@@ -99,7 +120,7 @@ export function migrationForUpload(compose: ComposeResult, recreate = false): Si
 }
 
 /** Convert the composed wrangler config's vars + DO bindings (+ secrets) into WfP script bindings. */
-export function toWfpBindings(config: GeneratedWrangler, secrets: Record<string, string> = {}): WfpBinding[] {
+export function toWfpBindings(config: TenantScriptConfig, secrets: Record<string, string> = {}): WfpBinding[] {
   const bindings: WfpBinding[] = [];
   const secretNames = new Set(Object.keys(secrets));
 
@@ -115,7 +136,6 @@ export function toWfpBindings(config: GeneratedWrangler, secrets: Record<string,
       type: "durable_object_namespace",
       name: b.name,
       class_name: b.class_name,
-      ...(b.script_name ? { script_name: b.script_name } : {}),
     });
   }
   return bindings;
@@ -124,11 +144,14 @@ export function toWfpBindings(config: GeneratedWrangler, secrets: Record<string,
 /** Build the `metadata` part. `migration` is carried through verbatim — this is where `migrations`
  *  MUST land (the whole point of this deploy path vs. `wrangler deploy`, which drops it). */
 export function buildMetadata(
-  config: GeneratedWrangler,
+  config: TenantScriptConfig,
   module: ScriptModule,
   migration: SingleStepMigration | null,
   secrets: Record<string, string> = {},
 ): WfpMetadata {
+  if (config.main !== module.filename) {
+    throw new WfpDeployError("entry module filename must equal the server-owned config main");
+  }
   return {
     main_module: module.filename,
     ...(config.compatibility_date ? { compatibility_date: config.compatibility_date } : {}),
@@ -140,6 +163,16 @@ export function buildMetadata(
 
 /** Assemble the multipart body: a `metadata` JSON part + the ES-module part(s). */
 export function buildFormData(metadata: WfpMetadata, module: ScriptModule, additionalModules: ScriptModule[] = []): FormData {
+  assertModule(module);
+  for (const additional of additionalModules) assertModule(additional);
+  const filenames = new Set([module.filename]);
+  for (const additional of additionalModules) {
+    if (filenames.has(additional.filename)) throw new WfpDeployError("tenant module filenames must be unique");
+    filenames.add(additional.filename);
+  }
+  if (metadata.main_module !== module.filename) {
+    throw new WfpDeployError("entry module filename must equal metadata.main_module");
+  }
   const form = new FormData();
   form.append("metadata", new Blob([JSON.stringify(metadata)], { type: "application/json" }));
   const appendModule = (m: ScriptModule) => {
@@ -164,6 +197,7 @@ async function readEnvelope(res: Response): Promise<CfEnvelope> {
 
 /** Delete a tenant script (the delete half of the delete+recreate path). Idempotent-ish: a 404 is fine. */
 export async function deleteTenantScript(cf: CfCreds, scriptName: string, fetchImpl: typeof fetch = fetch): Promise<void> {
+  assertAgentScriptName(scriptName);
   const res = await fetchImpl(`${scriptUrl(cf, scriptName)}?force=true`, {
     method: "DELETE",
     headers: { authorization: `Bearer ${cf.apiToken}` },
@@ -192,6 +226,7 @@ export async function deployTenantScript(
   opts: DeployOptions = {},
 ): Promise<DeployResult> {
   const fetchImpl = opts.fetchImpl ?? fetch;
+  assertAgentScriptName(scriptName);
 
   if (opts.recreate) await deleteTenantScript(cf, scriptName, fetchImpl);
 

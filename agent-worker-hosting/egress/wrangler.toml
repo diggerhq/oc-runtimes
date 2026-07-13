@@ -1,0 +1,13 @@
+name = "oc-agent-egress-local"
+main = "src/index.ts"
+compatibility_date = "2026-04-01"
+compatibility_flags = ["nodejs_compat"]
+workers_dev = false
+
+# Production is deliberately available only through `npm run deploy:production` and has no route.
+[env.production]
+name = "oc-agent-egress-prod"
+workers_dev = false
+
+[env.production.vars]
+MANAGED_EGRESS_HOSTS = "oc-agent-gateway-prod.mo-b8f.workers.dev,api.opencomputer.dev"

@@ -7,6 +7,7 @@ import worker, { Env } from "../src/index.js";
 
 const DISPATCH_SECRET = "dispatch-secret";
 const KICK_SECRET = "kick-secret";
+const AGENT_ID = "agt_0123456789abcdef01234567";
 
 // Records what the tenant script received (proves byte-exactness), returns a canned 2xx.
 let forwarded: { url: string; method: string; hadDispatchAuth: boolean; hadDeferKick: boolean; body: string } | null;
@@ -20,8 +21,8 @@ function fakeDispatcher(scriptExists = true): DispatchNamespace {
           forwarded = {
             url: r.url,
             method: r.method,
-            hadDispatchAuth: r.headers.has("x-flue-dispatch-auth"),
-            hadDeferKick: r.headers.has("x-flue-defer-kick"),
+            hadDispatchAuth: r.headers.has("x-oc-agent-dispatch-auth"),
+            hadDeferKick: r.headers.has("x-oc-flue-defer-kick"),
             body: r.body ? await r.text() : "",
           };
           return new Response(JSON.stringify({ submissionId: "sub_accepted", offset: "12" }), { status: 202, headers: { "content-type": "application/json" } });
@@ -32,7 +33,13 @@ function fakeDispatcher(scriptExists = true): DispatchNamespace {
 }
 
 function env(over: Partial<Env> = {}): Env {
-  return { DISPATCHER: fakeDispatcher(), DISPATCH_AUTH_SECRET: DISPATCH_SECRET, KICK_AUTH_SECRET: KICK_SECRET, SESSIONS_API_URL: "https://sapi.test", ...over };
+  return {
+    DISPATCHER: fakeDispatcher(),
+    AGENT_DISPATCH_AUTH_SECRET: DISPATCH_SECRET,
+    FLUE_KICK_AUTH_SECRET: KICK_SECRET,
+    SESSIONS_API_URL: "https://sapi.test",
+    ...over,
+  };
 }
 function ctx() {
   const pending: Promise<unknown>[] = [];
@@ -40,7 +47,7 @@ function ctx() {
 }
 const drain = (c: ExecutionContext) => Promise.all((c as unknown as { _p: Promise<unknown>[] })._p);
 
-const admitUrl = "https://disp.test/dispatch/agt_123/agents/support/ses_abc";
+const admitUrl = `https://disp.test/dispatch/${AGENT_ID}/agents/support/ses_abc`;
 const admit = (headers: Record<string, string>) =>
   new Request(admitUrl, { method: "POST", headers: { "content-type": "application/json", ...headers }, body: JSON.stringify({ message: "hi" }) });
 
@@ -60,7 +67,7 @@ describe("dispatch Worker", () => {
   });
 
   it("rejects the wrong dedicated dispatch bearer before tenant selection", async () => {
-    const r = await worker.fetch(admit({ "x-flue-dispatch-auth": "wrong" }), env(), ctx());
+    const r = await worker.fetch(admit({ "x-oc-agent-dispatch-auth": "wrong" }), env(), ctx());
     expect(r.status).toBe(401);
     expect(forwarded).toBeNull();
   });
@@ -69,7 +76,7 @@ describe("dispatch Worker", () => {
     const kick = vi.fn(async (_u: RequestInfo | URL, _i?: RequestInit) => new Response("ok"));
     vi.stubGlobal("fetch", kick);
     const c = ctx();
-    const r = await worker.fetch(admit({ "x-flue-dispatch-auth": DISPATCH_SECRET }), env(), c);
+    const r = await worker.fetch(admit({ "x-oc-agent-dispatch-auth": DISPATCH_SECRET }), env(), c);
     expect(r.status).toBe(202);
     // the tenant saw exactly /agents/support/ses_abc — NOT the /dispatch/<script> prefix
     expect(new URL(forwarded!.url).pathname).toBe("/agents/support/ses_abc");
@@ -83,7 +90,7 @@ describe("dispatch Worker", () => {
     const [kurl, kinit] = kick.mock.calls[0]!;
     expect(String(kurl)).toBe("https://sapi.test/internal/flue/kick");
     expect(JSON.parse(kinit!.body as string)).toEqual({ session_id: "ses_abc", submission_id: "sub_accepted" });
-    expect(new Headers(kinit!.headers).get("x-flue-kick-auth")).toBe(KICK_SECRET);
+    expect(new Headers(kinit!.headers).get("x-oc-flue-kick-auth")).toBe(KICK_SECRET);
   });
 
   it("lets sessions-api defer the kick until its sole input event is durable", async () => {
@@ -91,8 +98,8 @@ describe("dispatch Worker", () => {
     vi.stubGlobal("fetch", kick);
     const c = ctx();
     const r = await worker.fetch(admit({
-      "x-flue-dispatch-auth": DISPATCH_SECRET,
-      "x-flue-defer-kick": "1",
+      "x-oc-agent-dispatch-auth": DISPATCH_SECRET,
+      "x-oc-flue-defer-kick": "1",
     }), env(), c);
     expect(r.status).toBe(202);
     expect(forwarded!.hadDeferKick).toBe(false);
@@ -110,7 +117,7 @@ describe("dispatch Worker", () => {
     const kick = vi.fn(async () => new Response("ok"));
     vi.stubGlobal("fetch", kick);
     const c = ctx();
-    const r = await worker.fetch(new Request("https://disp.test/dispatch/agt_123/agents/support/ses_abc?view=updates", { headers: { "x-flue-dispatch-auth": DISPATCH_SECRET } }), env(), c);
+    const r = await worker.fetch(new Request(`https://disp.test/dispatch/${AGENT_ID}/agents/support/ses_abc?view=updates`, { headers: { "x-oc-agent-dispatch-auth": DISPATCH_SECRET } }), env(), c);
     expect(r.status).toBe(202);
     expect(new URL(forwarded!.url).pathname).toBe("/agents/support/ses_abc");
     expect(new URL(forwarded!.url).search).toBe("?view=updates"); // query preserved byte-exact
@@ -119,7 +126,16 @@ describe("dispatch Worker", () => {
   });
 
   it("unknown tenant script → 404", async () => {
-    const r = await worker.fetch(admit({ "x-flue-dispatch-auth": DISPATCH_SECRET }), env({ DISPATCHER: fakeDispatcher(false) }), ctx());
+    const r = await worker.fetch(admit({ "x-oc-agent-dispatch-auth": DISPATCH_SECRET }), env({ DISPATCHER: fakeDispatcher(false) }), ctx());
     expect(r.status).toBe(404);
+  });
+
+  it("rejects a non-canonical tenant name before namespace selection", async () => {
+    const request = new Request("https://disp.test/dispatch/agt_short/agents/support/ses_abc", {
+      headers: { "x-oc-agent-dispatch-auth": DISPATCH_SECRET },
+    });
+    const r = await worker.fetch(request, env(), ctx());
+    expect(r.status).toBe(400);
+    expect(forwarded).toBeNull();
   });
 });

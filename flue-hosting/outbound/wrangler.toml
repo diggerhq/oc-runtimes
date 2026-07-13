@@ -1,9 +1,0 @@
-name = "flue-outbound"
-main = "src/index.ts"
-compatibility_date = "2026-04-01"
-compatibility_flags = ["nodejs_compat"]
-
-[vars]
-# Exact hosts only. Before binding this Worker, include the hostname from V3_FLUE_GATEWAY_URL plus
-# each managed OC API the tenant runtime calls. Tenant-configurable egress is deferred past preview.
-MANAGED_EGRESS_HOSTS = "api.opencomputer.dev,app.opencomputer.dev"

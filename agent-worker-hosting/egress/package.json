@@ -1,16 +1,17 @@
 {
-  "name": "flue-dispatch",
+  "name": "oc-agent-egress",
   "version": "0.1.0",
   "private": true,
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",
-    "deploy": "wrangler deploy",
+    "deploy": "node -e \"throw new Error('choose an explicit environment; production is deploy:production')\"",
+    "deploy:production": "wrangler deploy --env production",
     "typecheck": "tsc --noEmit",
     "test": "vitest run"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^4.20240924.0",
+    "@cloudflare/workers-types": "^5.20260708.1",
     "typescript": "^5.5.0",
     "vitest": "^2.0.0",
     "wrangler": "^4.92.0"
