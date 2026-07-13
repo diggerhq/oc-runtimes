@@ -1,34 +1,24 @@
+// Load-bearing: multipart WfP upload with declarative Durable Object exports.
+//
 // Deploy a composed tenant config to Workers-for-Platforms via the RAW multipart script-upload API
 // (contract #4, design 013 §3/§6). This is the ONLY supported vehicle for tenant scripts.
 //
-// ⚠️  NEVER deploy a tenant with `wrangler deploy --dispatch-namespace <ns>`. Wrangler SILENTLY DROPS
-//     the Durable Object migrations — the uploaded script lands with `migrations: null`, so its
-//     SQLite-backed DO 500s at runtime with **"SQL is not enabled"** (W6, 2026-07-07). The migrations
-//     (`new_sqlite_classes`) only survive when carried in the `metadata` part of THIS multipart PUT.
+// Flue exports dynamically wrapped Durable Object classes. Cloudflare cannot infer those classes from
+// JavaScript alone, so the upload MUST declare each validated class in `metadata.exports`. Declarative
+// exports own SQLite class provisioning and are mutually exclusive with legacy `metadata.migrations`.
 //
 // This step consumes the contract-#4 composer output (`ComposeResult` from compose-wrangler.ts) and
 // PUTs it to:
 //   PUT https://api.cloudflare.com/client/v4/accounts/{acct}/workers/dispatch/namespaces/{ns}/scripts/{name}
 // with a multipart/form-data body = an ES-module part + a `metadata` part carrying `main_module`,
-// `bindings` (incl. the `durable_object_namespace` bindings), `compatibility_*`, and — critically —
-// the `migrations` object synthesized by the composer's append-never-reorder ledger.
+// `bindings` (incl. the `durable_object_namespace` bindings), `compatibility_*`, and the declarative
+// Durable Object `exports` synthesized from the same server-validated class list.
 
-import type {
-  ComposeResult,
-  MigrationEntry,
-  TenantScriptConfig,
-} from "./compose-wrangler.js";
+import type { ComposeResult, TenantScriptConfig } from "./compose-wrangler.js";
 
 const DEFAULT_API_BASE = "https://api.cloudflare.com/client/v4";
 const MODULE_CONTENT_TYPE = "application/javascript+module";
 const AGENT_ID = /^agt_[0-9a-f]{24}$/;
-
-/** A single WfP migration step (the shape the script-upload `metadata.migrations` field accepts). */
-export interface SingleStepMigration {
-  old_tag?: string;
-  new_tag: string;
-  new_sqlite_classes: string[];
-}
 
 /** A WfP script binding (subset — the ones OC tenant scripts use). */
 export type WfpBinding =
@@ -36,13 +26,18 @@ export type WfpBinding =
   | { type: "secret_text"; name: string; text: string }
   | { type: "durable_object_namespace"; name: string; class_name: string };
 
+export interface WfpDurableObjectExport {
+  type: "durable-object";
+  storage: "sqlite";
+}
+
 /** The `metadata` part of the multipart upload. */
 export interface WfpMetadata {
   main_module: string;
   compatibility_date?: string;
   compatibility_flags?: string[];
   bindings: WfpBinding[];
-  migrations?: SingleStepMigration;
+  exports: Record<string, WfpDurableObjectExport>;
 }
 
 /** The built ES-module artifact from `flue build --target cloudflare` (already bundled — this step
@@ -56,7 +51,7 @@ export interface ScriptModule {
 export interface CfCreds {
   accountId: string;
   apiToken: string;
-  namespace: string; // WfP dispatch namespace (a THROWAWAY ns for checks; NEVER `opencomputer-agent`)
+  namespace: string; // WfP dispatch namespace; provisioned out of band and pinned by runner policy
   apiBase?: string;
 }
 
@@ -65,8 +60,8 @@ export interface DeployOptions {
   secrets?: Record<string, string>;
   /** Extra verified .js/.mjs modules besides the entry. */
   additionalModules?: ScriptModule[];
-  /** Re-applying a CHANGED migration is impossible in place — WfP rejects it. Set to delete+recreate
-   *  the script and replay the FULL ledger as one fresh migration (design 013 §6.1, blue/green). */
+  /** Explicitly delete the script before upload. This destroys the current tenant script identity and
+   *  lets declarative exports provision its classes from scratch; normal revisions never need it. */
   recreate?: boolean;
   /** Injectable for tests. Defaults to global fetch. */
   fetchImpl?: typeof fetch;
@@ -88,35 +83,6 @@ function assertModule(module: ScriptModule): void {
     || segments.some((segment) => segment === "" || segment === "." || segment === "..")) {
     throw new WfpDeployError("tenant modules must use safe relative .js/.mjs paths");
   }
-}
-
-/** Flatten the append-only ledger into every SQLite class it has ever introduced (first-seen order). */
-function allLedgerClasses(ledger: MigrationEntry[]): string[] {
-  const out: string[] = [];
-  const seen = new Set<string>();
-  for (const m of ledger) for (const c of m.new_sqlite_classes ?? []) if (!seen.has(c)) { seen.add(c); out.push(c); }
-  return out;
-}
-
-/**
- * Derive the single WfP migration to send from the composer output.
- * - Normal (incremental) update against a script already at the previous tag: the last ledger step,
- *   `old_tag` = the tag before it (undefined when it's the first). Behavior-only revision (no new
- *   classes) → `null` (nothing to migrate; the script keeps its current tag).
- * - `recreate`: the script is being deleted+recreated, so there is NO migration history to build on —
- *   apply EVERY class the ledger has ever introduced in one fresh migration tagged at the current tag.
- */
-export function migrationForUpload(compose: ComposeResult, recreate = false): SingleStepMigration | null {
-  const { ledger, addedClasses } = compose;
-  if (!ledger.length) return null;
-  const newTag = ledger[ledger.length - 1]!.tag;
-
-  if (recreate) {
-    return { new_tag: newTag, new_sqlite_classes: allLedgerClasses(ledger) };
-  }
-  if (!addedClasses.length) return null; // behavior-only revision — no class migration needed
-  const oldTag = ledger.length >= 2 ? ledger[ledger.length - 2]!.tag : undefined;
-  return { ...(oldTag ? { old_tag: oldTag } : {}), new_tag: newTag, new_sqlite_classes: addedClasses };
 }
 
 /** Convert the composed wrangler config's vars + DO bindings (+ secrets) into WfP script bindings. */
@@ -141,12 +107,22 @@ export function toWfpBindings(config: TenantScriptConfig, secrets: Record<string
   return bindings;
 }
 
-/** Build the `metadata` part. `migration` is carried through verbatim — this is where `migrations`
- *  MUST land (the whole point of this deploy path vs. `wrangler deploy`, which drops it). */
+/** Declare every validated same-script class as a SQLite-backed Durable Object export. Flue's
+ *  generated wrappers are dynamic, so Cloudflare cannot infer this from the module syntax. */
+export function toWfpExports(config: TenantScriptConfig): Record<string, WfpDurableObjectExport> {
+  return Object.fromEntries(
+    (config.durable_objects?.bindings ?? []).map((binding) => [
+      binding.class_name,
+      { type: "durable-object", storage: "sqlite" } satisfies WfpDurableObjectExport,
+    ]),
+  );
+}
+
+/** Build the metadata part from server-owned config only. `exports` replaces legacy migrations;
+ *  Cloudflare rejects an upload that specifies both. */
 export function buildMetadata(
   config: TenantScriptConfig,
   module: ScriptModule,
-  migration: SingleStepMigration | null,
   secrets: Record<string, string> = {},
 ): WfpMetadata {
   if (config.main !== module.filename) {
@@ -157,7 +133,7 @@ export function buildMetadata(
     ...(config.compatibility_date ? { compatibility_date: config.compatibility_date } : {}),
     ...(config.compatibility_flags ? { compatibility_flags: config.compatibility_flags } : {}),
     bindings: toWfpBindings(config, secrets),
-    ...(migration ? { migrations: migration } : {}),
+    exports: toWfpExports(config),
   };
 }
 
@@ -209,12 +185,12 @@ export async function deleteTenantScript(cf: CfCreds, scriptName: string, fetchI
   }
 }
 
-export interface DeployResult { scriptName: string; migration: SingleStepMigration | null; result: unknown }
+export interface DeployResult { scriptName: string; result: unknown }
 
 /**
- * Deploy a composed tenant config to WfP via the multipart script-upload API. Consumes the composer's
- * `ComposeResult` so the synthesized `migrations` (`new_sqlite_classes`) travel in the metadata part —
- * the ONLY way DO migrations reach the uploaded script (never `wrangler deploy`).
+ * Deploy a composed tenant config to WfP via the multipart script-upload API. The composer's
+ * forward-only ledger still rejects class removal before this point; the live upload declares the
+ * current validated classes through `metadata.exports` so Cloudflare provisions SQLite-backed DOs.
  *
  * @param scriptName the WfP script name = the OC agent id (`agt_…`); one script per agent.
  */
@@ -230,8 +206,7 @@ export async function deployTenantScript(
 
   if (opts.recreate) await deleteTenantScript(cf, scriptName, fetchImpl);
 
-  const migration = migrationForUpload(compose, opts.recreate);
-  const metadata = buildMetadata(compose.config, module, migration, opts.secrets ?? {});
+  const metadata = buildMetadata(compose.config, module, opts.secrets ?? {});
   const form = buildFormData(metadata, module, opts.additionalModules ?? []);
 
   // NB: do NOT set content-type — fetch derives the multipart boundary from the FormData body.
@@ -246,5 +221,5 @@ export async function deployTenantScript(
     const detail = env.errors?.map((e) => `${e.code ?? ""} ${e.message ?? ""}`.trim()).join("; ") || res.statusText;
     throw new WfpDeployError(`WfP upload '${scriptName}' failed (${res.status}): ${detail}`);
   }
-  return { scriptName, migration, result: env.result };
+  return { scriptName, result: env.result };
 }
