@@ -43,12 +43,19 @@ Tenant scripts have no direct route. The production dispatch binding is the only
 
 ## Production error visibility
 
-The production dispatch Worker attaches `opencomputer-log-tail-prod`, the existing account-level
-log collector owned by the `opencomputer` repository. Cloudflare applies that tail consumer to both
-the dispatch invocation and nested user-Worker invocations in `oc-agent-workers-prod`, including
-Workers uploaded after the dispatch deploy. Flue keeps unknown failures out of caller-facing 500
+Production uses the existing `opencomputer-log-tail-prod` account-level collector owned by the
+`opencomputer` repository at both layers of execution:
+
+- the dispatch Worker declares it in `wrangler.toml`, capturing the authenticated outer request,
+  routing status, and top-level tenant invocation;
+- every tenant upload declares it in WfP `metadata.tail_consumers`, capturing console output and
+  exceptions from the tenant's Durable Objects and alarms.
+
+The direct tenant attachment is load-bearing: a consumer inherited only from dispatch does not
+receive Durable Object console output. Flue keeps unknown failures out of caller-facing 500
 responses but logs the original stack; the collector therefore records the actionable failure with
-the tenant script name (`agt_*`) and request URL (including `ses_*`) without exposing it to clients.
+the tenant script name (`agt_*`), request URL (including `ses_*`), and Flue's submission context
+without exposing it to clients. An upload without a tail consumer fails before the Cloudflare call.
 
 Do not diagnose a managed-agent failure by changing its HTTP error envelope or uploading a debug
 tenant bundle. Query the central Worker logs by tenant script/session first. A production dispatch

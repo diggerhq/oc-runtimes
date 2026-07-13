@@ -34,6 +34,7 @@ const cf: CfCreds = {
   accountId: "account-id",
   apiToken: "cf-token",
   namespace: "oc-agent-workers-prod",
+  tailConsumerService: "opencomputer-log-tail-prod",
   apiBase: "https://cf.test/v4",
 };
 const module: ScriptModule = {
@@ -62,18 +63,21 @@ describe("WfP metadata", () => {
       FlueOneAgent: { type: "durable-object", storage: "sqlite" },
       FlueRegistry: { type: "durable-object", storage: "sqlite" },
     });
-    const metadata = buildMetadata(result.config, module);
+    const metadata = buildMetadata(result.config, module, {}, cf.tailConsumerService);
     expect(metadata).not.toHaveProperty("migrations");
+    expect(metadata.tail_consumers).toEqual([{ service: "opencomputer-log-tail-prod" }]);
   });
 
   it("requires the entry module to match the server-owned main", () => {
     const result = composeWrangler(descriptor(["one"]), oc);
-    expect(() => buildMetadata(result.config, { ...module, filename: "other.js" })).toThrow(WfpDeployError);
+    expect(() => buildMetadata(
+      result.config, { ...module, filename: "other.js" }, {}, cf.tailConsumerService,
+    )).toThrow(WfpDeployError);
   });
 
   it("builds a module-only multipart body", async () => {
     const result = composeWrangler(descriptor(["one"]), oc);
-    const metadata = buildMetadata(result.config, module);
+    const metadata = buildMetadata(result.config, module, {}, cf.tailConsumerService);
     const form = buildFormData(metadata, module, [{ filename: "chunks/helper.mjs", content: "export {}" }]);
     expect(JSON.parse(await (form.get("metadata") as File).text())).toEqual(metadata);
     expect(await (form.get("index.js") as File).text()).toBe(module.content);
@@ -81,10 +85,19 @@ describe("WfP metadata", () => {
   });
 
   it("rejects unsafe or duplicate module paths", () => {
-    const metadata: WfpMetadata = { main_module: "../index.js", bindings: [], exports: {} };
+    const metadata: WfpMetadata = {
+      main_module: "../index.js", bindings: [], exports: {}, tail_consumers: [{ service: "tail" }],
+    };
     expect(() => buildFormData(metadata, { ...module, filename: "../index.js" })).toThrow(WfpDeployError);
-    const safeMetadata: WfpMetadata = { main_module: "index.js", bindings: [], exports: {} };
+    const safeMetadata: WfpMetadata = {
+      main_module: "index.js", bindings: [], exports: {}, tail_consumers: [{ service: "tail" }],
+    };
     expect(() => buildFormData(safeMetadata, module, [module])).toThrow(/unique/);
+  });
+
+  it("refuses an upload metadata document without central error collection", () => {
+    const result = composeWrangler(descriptor(["one"]), oc);
+    expect(() => buildMetadata(result.config, module, {}, "")).toThrow(/central tail consumer/);
   });
 });
 
@@ -100,6 +113,8 @@ describe("deployTenantScript", () => {
     expect(captured?.url).toBe(`https://cf.test/v4/accounts/account-id/workers/dispatch/namespaces/oc-agent-workers-prod/scripts/${AGENT_ID}`);
     expect(captured?.method).toBe("PUT");
     expect((captured?.body.get("metadata") as File)).toBeInstanceOf(File);
+    const metadata = JSON.parse(await (captured?.body.get("metadata") as File).text()) as WfpMetadata;
+    expect(metadata.tail_consumers).toEqual([{ service: "opencomputer-log-tail-prod" }]);
   });
 
   it("rejects a non-canonical script name before any Cloudflare call", async () => {
