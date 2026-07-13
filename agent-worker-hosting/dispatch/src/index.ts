@@ -88,7 +88,8 @@ export default {
     tenantUrl.pathname = p.tenantPath;
     const fwdHeaders = new Headers(req.headers);
     fwdHeaders.delete("x-oc-agent-dispatch-auth");
-    const deferKick = fwdHeaders.get("x-oc-flue-defer-kick") === "1";
+    // Strip the retired control-plane header during the rolling cutover too. Admission intent is
+    // now durable before the POST, so suppressing the edge kick only creates a crash window.
     fwdHeaders.delete("x-oc-flue-defer-kick");
     // `duplex: "half"` is required by undici (node/tests) when forwarding a streaming body; the
     // Workers runtime accepts it too. GET/HEAD have a null body → no duplex needed.
@@ -107,8 +108,11 @@ export default {
       return json({ error: { type: "script_not_found", message: `no tenant script '${p.script}': ${msg}` } }, 404);
     }
 
-    // ── tailer kick on a successful inbound admit (W5 → W1/W2) ──────────────────────
-    if (p.isAdmit && p.sessionId && resp.status < 300 && !deferKick) {
+    // ── tailer kick on a confirmed or ambiguous inbound admit (W5 → W1/W2) ──────────
+    // A tenant 5xx can occur after Flue durably inserted the submission but before returning its
+    // receipt. Kick on that ambiguous outcome too (without a submission id when the error envelope
+    // has none) so OC tails/reconciles the work instead of inviting a duplicate POST retry.
+    if (p.isAdmit && p.sessionId && (resp.status < 300 || resp.status >= 500)) {
       ctx.waitUntil(kickAdmittedTailer(env, p.sessionId, resp.clone()));
     }
 

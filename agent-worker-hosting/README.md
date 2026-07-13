@@ -31,13 +31,15 @@ The sessions API calls:
 ```text
 POST /dispatch/<agt_id>/agents/<flue_agent_name>/<session_id>
 X-OC-Agent-Dispatch-Auth: <dedicated bearer>
-X-OC-Flue-Defer-Kick: 1  # only while the control plane durably records the admitted input
 ```
 
-The Worker accepts only `^agt_[0-9a-f]{24}$`, strips the two control headers, and forwards the
-remaining method, path tail, query, headers and body to the selected tenant script. A successful
-Flue admit is followed by a best-effort `/internal/flue/kick` using
-`X-OC-Flue-Kick-Auth`; the durable reconciler remains the recovery path.
+The Worker accepts only `^agt_[0-9a-f]{24}$`, strips the dispatch bearer (and the retired
+`X-OC-Flue-Defer-Kick` header during cutover), and forwards the remaining method, path tail, query,
+headers and body to the selected tenant script. OC persists the input and admission intent before
+this call, so every 2xx admit is followed immediately by a best-effort `/internal/flue/kick` using
+`X-OC-Flue-Kick-Auth`. Tenant 5xx responses are kicked too: Flue may already have durably inserted
+the submission before losing its receipt, and the tailer must reconcile that ambiguous result
+without a duplicate POST. The durable reconciler remains the recovery path.
 
 Tenant scripts have no direct route. The production dispatch binding is the only invocation path.
 
