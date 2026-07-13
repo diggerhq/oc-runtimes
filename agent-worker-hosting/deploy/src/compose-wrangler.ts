@@ -1,6 +1,7 @@
-// Flue adapter: compose one server-owned tenant-script config from the deliberately small
-// descriptor extracted from `flue build --target cloudflare`. The raw generated wrangler.json is a
-// build-tool resolution dump and is never an API or persistence contract.
+// Flue-specific composition for the only runtime this deploy package supports today. Keep this
+// flat until a second runtime creates a real shared interface; the hosting topology is neutral, but
+// the implementation need not pretend to have multiple adapters. The raw generated wrangler.json
+// is a build-tool resolution dump and is never an API or persistence contract.
 
 export const FLUE_COMPATIBILITY_DATE = "2026-04-01" as const;
 export const FLUE_COMPATIBILITY_FLAGS = ["nodejs_compat"] as const;

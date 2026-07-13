@@ -46,7 +46,11 @@ function verify(result: NamespaceResult | undefined): void {
   if (result?.namespace_name !== PRODUCTION_NAMESPACE) {
     throw new NamespaceProvisionError("Cloudflare returned an unexpected dispatch namespace");
   }
-  if (result.trusted_workers !== false) {
+  // Cloudflare documents untrusted mode as the default and `trusted_workers` as optional. Its live
+  // GET responses omit the field for default-untrusted namespaces; an explicit true enables
+  // the weaker trusted mode. Accept only the documented default omission or explicit false, and
+  // reject true/null/any future unrecognized representation rather than mutating the namespace.
+  if (result.trusted_workers !== undefined && result.trusted_workers !== false) {
     throw new NamespaceProvisionError(
       `dispatch namespace ${PRODUCTION_NAMESPACE} must exist in untrusted mode; refusing to mutate it`,
     );

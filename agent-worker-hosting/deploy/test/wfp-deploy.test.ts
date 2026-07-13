@@ -3,7 +3,7 @@ import {
   composeWrangler,
   type FlueWranglerDescriptor,
   type MigrationEntry,
-} from "../src/adapters/flue/compose-wrangler.js";
+} from "../src/compose-wrangler.js";
 import {
   buildFormData,
   buildMetadata,

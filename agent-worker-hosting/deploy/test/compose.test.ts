@@ -7,7 +7,7 @@ import {
   MigrationLedgerError,
   parseFlueWranglerDescriptor,
   type FlueWranglerDescriptor,
-} from "../src/adapters/flue/compose-wrangler.js";
+} from "../src/compose-wrangler.js";
 
 const descriptor = (agents: string[]): FlueWranglerDescriptor => ({
   main: "index.js",

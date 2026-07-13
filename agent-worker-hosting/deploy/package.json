@@ -5,7 +5,7 @@
   "type": "module",
   "exports": {
     "./wfp-deploy": "./src/wfp-deploy.ts",
-    "./adapters/flue/compose-wrangler": "./src/adapters/flue/compose-wrangler.ts"
+    "./compose-wrangler": "./src/compose-wrangler.ts"
   },
   "scripts": {
     "provision:production": "tsx src/provision-production.ts",

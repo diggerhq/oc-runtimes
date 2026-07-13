@@ -9,10 +9,10 @@ production plane uses one untrusted dispatch namespace and three separately depl
 | `egress/` | allow only exact platform-managed HTTPS endpoints plus framework-internal synthetic requests |
 | `deploy/` | provision the namespace and upload verified module-only tenant artifacts through the WfP API |
 
-Flue is one adapter inside this plane. Its migration composer lives at
-`deploy/src/adapters/flue/compose-wrangler.ts`; generic multipart upload remains at
-`deploy/src/wfp-deploy.ts`. Do not rename real Flue protocol or generated ABI names to make them
-look framework-neutral.
+Flue is the only runtime implementation in this plane today. Its descriptor/migration composer
+lives flat at `deploy/src/compose-wrangler.ts` beside the multipart uploader; do not introduce an
+adapter directory until a second runtime creates a real shared interface. Do not rename real Flue
+protocol or generated ABI names to make them look framework-neutral.
 
 ## Production identities
 
@@ -40,6 +40,14 @@ Flue admit is followed by a best-effort `/internal/flue/kick` using
 `X-OC-Flue-Kick-Auth`; the durable reconciler remains the recovery path.
 
 Tenant scripts have no direct route. The production dispatch binding is the only invocation path.
+
+## Production egress contract
+
+`MANAGED_EGRESS_HOSTS` contains exactly the permanent gateway hostname and
+`api.opencomputer.dev`. W7-P binds `OC_GATEWAY` to the former and `OC_SANDBOX_API` to the latter;
+it does not bind `OC_INGEST` or `OC_REPO_API`. `app.opencomputer.dev` is the browser/legacy edge and
+is intentionally denied. A future tenant binding that introduces another network destination must
+update this allowlist and its allow/deny test in the same change.
 
 ## Flue descriptor and upload boundary
 

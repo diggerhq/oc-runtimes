@@ -30,6 +30,17 @@ describe("provisionProductionNamespace", () => {
     expect(fetchMock.mock.calls[0]?.[1]?.method).toBeUndefined();
   });
 
+  it("accepts Cloudflare's live default-untrusted shape when trusted_workers is omitted", async () => {
+    const fetchMock = vi.fn(async () => json({ namespace_name: PRODUCTION_NAMESPACE }));
+    const fetchImpl = fetchMock as unknown as typeof fetch;
+    await expect(provisionProductionNamespace(config, fetchImpl)).resolves.toEqual({
+      namespace: PRODUCTION_NAMESPACE,
+      created: false,
+      trustedWorkers: false,
+    });
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
   it("creates only the exact production namespace after a 404", async () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(json(undefined, 404))
@@ -43,6 +54,13 @@ describe("provisionProductionNamespace", () => {
 
   it("refuses a trusted namespace rather than toggling it", async () => {
     const fetchMock = vi.fn(async () => json({ namespace_name: PRODUCTION_NAMESPACE, trusted_workers: true }));
+    const fetchImpl = fetchMock as unknown as typeof fetch;
+    await expect(provisionProductionNamespace(config, fetchImpl)).rejects.toThrow(NamespaceProvisionError);
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it("refuses an unrecognized null trust value rather than assuming isolation", async () => {
+    const fetchMock = vi.fn(async () => json({ namespace_name: PRODUCTION_NAMESPACE, trusted_workers: null }));
     const fetchImpl = fetchMock as unknown as typeof fetch;
     await expect(provisionProductionNamespace(config, fetchImpl)).rejects.toThrow(NamespaceProvisionError);
     expect(fetchMock).toHaveBeenCalledOnce();

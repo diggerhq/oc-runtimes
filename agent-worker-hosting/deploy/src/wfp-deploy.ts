@@ -17,7 +17,7 @@ import type {
   ComposeResult,
   MigrationEntry,
   TenantScriptConfig,
-} from "./adapters/flue/compose-wrangler.js";
+} from "./compose-wrangler.js";
 
 const DEFAULT_API_BASE = "https://api.cloudflare.com/client/v4";
 const MODULE_CONTENT_TYPE = "application/javascript+module";
