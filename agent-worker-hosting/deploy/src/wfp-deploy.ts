@@ -11,8 +11,9 @@
 // PUTs it to:
 //   PUT https://api.cloudflare.com/client/v4/accounts/{acct}/workers/dispatch/namespaces/{ns}/scripts/{name}
 // with a multipart/form-data body = an ES-module part + a `metadata` part carrying `main_module`,
-// `bindings` (incl. the `durable_object_namespace` bindings), `compatibility_*`, and the declarative
-// Durable Object `exports` synthesized from the same server-validated class list.
+// `bindings` (incl. the `durable_object_namespace` bindings), `compatibility_*`, the declarative
+// Durable Object `exports` synthesized from the same server-validated class list, and the central
+// Tail Worker attachment required for operator-side error visibility.
 
 import type { ComposeResult, TenantScriptConfig } from "./compose-wrangler.js";
 
@@ -38,6 +39,10 @@ export interface WfpMetadata {
   compatibility_flags?: string[];
   bindings: WfpBinding[];
   exports: Record<string, WfpDurableObjectExport>;
+  /** Same-account Tail Worker that receives the tenant Worker's request, console, exception,
+   *  alarm, and Durable Object traces. This is the operator-side half of the safe error contract:
+   *  callers keep a sanitized 500 while the original failure remains centrally diagnosable. */
+  tail_consumers: Array<{ service: string }>;
 }
 
 /** The built ES-module artifact from `flue build --target cloudflare` (already bundled — this step
@@ -52,6 +57,7 @@ export interface CfCreds {
   accountId: string;
   apiToken: string;
   namespace: string; // WfP dispatch namespace; provisioned out of band and pinned by runner policy
+  tailConsumerService: string; // same-account central Worker log collector; required on every upload
   apiBase?: string;
 }
 
@@ -124,9 +130,13 @@ export function buildMetadata(
   config: TenantScriptConfig,
   module: ScriptModule,
   secrets: Record<string, string> = {},
+  tailConsumerService: string,
 ): WfpMetadata {
   if (config.main !== module.filename) {
     throw new WfpDeployError("entry module filename must equal the server-owned config main");
+  }
+  if (!tailConsumerService.trim()) {
+    throw new WfpDeployError("tenant upload requires a central tail consumer service");
   }
   return {
     main_module: module.filename,
@@ -134,6 +144,7 @@ export function buildMetadata(
     ...(config.compatibility_flags ? { compatibility_flags: config.compatibility_flags } : {}),
     bindings: toWfpBindings(config, secrets),
     exports: toWfpExports(config),
+    tail_consumers: [{ service: tailConsumerService }],
   };
 }
 
@@ -206,7 +217,7 @@ export async function deployTenantScript(
 
   if (opts.recreate) await deleteTenantScript(cf, scriptName, fetchImpl);
 
-  const metadata = buildMetadata(compose.config, module, opts.secrets ?? {});
+  const metadata = buildMetadata(compose.config, module, opts.secrets ?? {}, cf.tailConsumerService);
   const form = buildFormData(metadata, module, opts.additionalModules ?? []);
 
   // NB: do NOT set content-type — fetch derives the multipart boundary from the FormData body.

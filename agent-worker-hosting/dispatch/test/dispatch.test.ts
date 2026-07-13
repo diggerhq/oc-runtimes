@@ -11,7 +11,7 @@ const AGENT_ID = "agt_0123456789abcdef01234567";
 
 // Records what the tenant script received (proves byte-exactness), returns a canned 2xx.
 let forwarded: { url: string; method: string; hadDispatchAuth: boolean; hadDeferKick: boolean; body: string } | null;
-function fakeDispatcher(scriptExists = true): DispatchNamespace {
+function fakeDispatcher(scriptExists = true, status = 202): DispatchNamespace {
   return {
     get: (script: string) => {
       if (!scriptExists) throw new Error(`Worker '${script}' not found`);
@@ -25,7 +25,10 @@ function fakeDispatcher(scriptExists = true): DispatchNamespace {
             hadDeferKick: r.headers.has("x-oc-flue-defer-kick"),
             body: r.body ? await r.text() : "",
           };
-          return new Response(JSON.stringify({ submissionId: "sub_accepted", offset: "12" }), { status: 202, headers: { "content-type": "application/json" } });
+          const body = status < 300
+            ? { submissionId: "sub_accepted", offset: "12" }
+            : { error: { type: "internal_error", message: "internal server error" } };
+          return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
         },
       } as unknown as Fetcher;
     },
@@ -93,7 +96,7 @@ describe("dispatch Worker", () => {
     expect(new Headers(kinit!.headers).get("x-oc-flue-kick-auth")).toBe(KICK_SECRET);
   });
 
-  it("lets sessions-api defer the kick until its sole input event is durable", async () => {
+  it("strips the retired defer header but no longer suppresses a durable admission kick", async () => {
     const kick = vi.fn(async () => new Response("ok"));
     vi.stubGlobal("fetch", kick);
     const c = ctx();
@@ -104,7 +107,23 @@ describe("dispatch Worker", () => {
     expect(r.status).toBe(202);
     expect(forwarded!.hadDeferKick).toBe(false);
     await drain(c);
-    expect(kick).not.toHaveBeenCalled();
+    expect(kick).toHaveBeenCalledOnce();
+  });
+
+  it("kicks on an ambiguous tenant 5xx even when no submission receipt is available", async () => {
+    const kick = vi.fn(async (_u: RequestInfo | URL, _i?: RequestInit) => new Response("ok"));
+    vi.stubGlobal("fetch", kick);
+    const c = ctx();
+    const r = await worker.fetch(
+      admit({ "x-oc-agent-dispatch-auth": DISPATCH_SECRET }),
+      env({ DISPATCHER: fakeDispatcher(true, 500) }),
+      c,
+    );
+    expect(r.status).toBe(500);
+    await drain(c);
+    expect(kick).toHaveBeenCalledOnce();
+    const [, kinit] = kick.mock.calls[0]!;
+    expect(JSON.parse(kinit!.body as string)).toEqual({ session_id: "ses_abc" });
   });
 
   it("rejects browser client tokens because they terminate at the sessions API", async () => {

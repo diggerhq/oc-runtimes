@@ -31,15 +31,37 @@ The sessions API calls:
 ```text
 POST /dispatch/<agt_id>/agents/<flue_agent_name>/<session_id>
 X-OC-Agent-Dispatch-Auth: <dedicated bearer>
-X-OC-Flue-Defer-Kick: 1  # only while the control plane durably records the admitted input
 ```
 
-The Worker accepts only `^agt_[0-9a-f]{24}$`, strips the two control headers, and forwards the
-remaining method, path tail, query, headers and body to the selected tenant script. A successful
-Flue admit is followed by a best-effort `/internal/flue/kick` using
-`X-OC-Flue-Kick-Auth`; the durable reconciler remains the recovery path.
+The Worker accepts only `^agt_[0-9a-f]{24}$`, strips the dispatch bearer (and the retired
+`X-OC-Flue-Defer-Kick` header during cutover), and forwards the remaining method, path tail, query,
+headers and body to the selected tenant script. OC persists the input and admission intent before
+this call, so every 2xx admit is followed immediately by a best-effort `/internal/flue/kick` using
+`X-OC-Flue-Kick-Auth`. Tenant 5xx responses are kicked too: Flue may already have durably inserted
+the submission before losing its receipt, and the tailer must reconcile that ambiguous result
+without a duplicate POST. The durable reconciler remains the recovery path.
 
 Tenant scripts have no direct route. The production dispatch binding is the only invocation path.
+
+## Production error visibility
+
+Production uses the existing `opencomputer-log-tail-prod` account-level collector owned by the
+`opencomputer` repository at both layers of execution:
+
+- the dispatch Worker declares it in `wrangler.toml`, capturing the authenticated outer request,
+  routing status, and top-level tenant invocation;
+- every tenant upload declares it in WfP `metadata.tail_consumers`, capturing console output and
+  exceptions from the tenant's Durable Objects and alarms.
+
+The direct tenant attachment is load-bearing: a consumer inherited only from dispatch does not
+receive Durable Object console output. Flue keeps unknown failures out of caller-facing 500
+responses but logs the original stack; the collector therefore records the actionable failure with
+the tenant script name (`agt_*`), request URL (including `ses_*`), and Flue's submission context
+without exposing it to clients. An upload without a tail consumer fails before the Cloudflare call.
+
+Do not diagnose a managed-agent failure by changing its HTTP error envelope or uploading a debug
+tenant bundle. Query the central Worker logs by tenant script/session first. A production dispatch
+deploy must preserve this tail consumer; a missing collector is a production-readiness failure.
 
 ## Production egress contract
 
