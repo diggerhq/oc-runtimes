@@ -41,6 +41,19 @@ Flue admit is followed by a best-effort `/internal/flue/kick` using
 
 Tenant scripts have no direct route. The production dispatch binding is the only invocation path.
 
+## Production error visibility
+
+The production dispatch Worker attaches `opencomputer-log-tail-prod`, the existing account-level
+log collector owned by the `opencomputer` repository. Cloudflare applies that tail consumer to both
+the dispatch invocation and nested user-Worker invocations in `oc-agent-workers-prod`, including
+Workers uploaded after the dispatch deploy. Flue keeps unknown failures out of caller-facing 500
+responses but logs the original stack; the collector therefore records the actionable failure with
+the tenant script name (`agt_*`) and request URL (including `ses_*`) without exposing it to clients.
+
+Do not diagnose a managed-agent failure by changing its HTTP error envelope or uploading a debug
+tenant bundle. Query the central Worker logs by tenant script/session first. A production dispatch
+deploy must preserve this tail consumer; a missing collector is a production-readiness failure.
+
 ## Production egress contract
 
 `MANAGED_EGRESS_HOSTS` contains exactly the permanent gateway hostname and
