@@ -1,0 +1,21 @@
+{
+  "name": "oc-agent-worker-deploy",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./wfp-deploy": "./src/wfp-deploy.ts",
+    "./compose-wrangler": "./src/compose-wrangler.ts"
+  },
+  "scripts": {
+    "provision:production": "tsx src/provision-production.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "tsx": "^4.20.0",
+    "typescript": "^5.5.0",
+    "vitest": "^2.0.0"
+  }
+}
