@@ -3,9 +3,6 @@
 // the implementation need not pretend to have multiple adapters. The raw generated wrangler.json
 // is a build-tool resolution dump and is never an API or persistence contract.
 
-export const FLUE_COMPATIBILITY_DATE = "2026-04-01" as const;
-export const FLUE_COMPATIBILITY_FLAGS = ["nodejs_compat"] as const;
-
 export interface SameScriptDurableObjectBinding {
   name: string;
   class_name: string;
@@ -14,8 +11,8 @@ export interface SameScriptDurableObjectBinding {
 /** The only Flue build metadata accepted across the CLI/control-plane boundary. */
 export interface FlueWranglerDescriptor {
   main: string;
-  compatibility_date: typeof FLUE_COMPATIBILITY_DATE;
-  compatibility_flags: ["nodejs_compat"];
+  compatibility_date: string;
+  compatibility_flags: string[];
   no_bundle: true;
   durable_objects: { bindings: SameScriptDurableObjectBinding[] };
 }
@@ -29,8 +26,8 @@ export interface MigrationEntry {
 /** Server-owned config consumed by the generic WfP uploader. */
 export interface TenantScriptConfig {
   main: string;
-  compatibility_date: typeof FLUE_COMPATIBILITY_DATE;
-  compatibility_flags: ["nodejs_compat"];
+  compatibility_date: string;
+  compatibility_flags: string[];
   durable_objects: { bindings: SameScriptDurableObjectBinding[] };
   migrations: MigrationEntry[];
   vars: Record<string, string>;
@@ -53,6 +50,8 @@ export class FlueWranglerDescriptorError extends Error {}
 export class MigrationLedgerError extends Error {}
 
 const IDENTIFIER = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
+const COMPATIBILITY_DATE = /^\d{4}-\d{2}-\d{2}$/;
+const COMPATIBILITY_FLAG = /^[A-Za-z0-9_-]{1,128}$/;
 
 function record(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === "object" && !Array.isArray(value)
@@ -72,6 +71,19 @@ export function isSafeModulePath(value: string): boolean {
   return segments.every((segment) => segment !== "" && segment !== "." && segment !== "..");
 }
 
+function isCompatibilityDate(value: unknown): value is string {
+  if (typeof value !== "string" || !COMPATIBILITY_DATE.test(value)) return false;
+  const date = new Date(`${value}T00:00:00Z`);
+  return !Number.isNaN(date.valueOf()) && date.toISOString().slice(0, 10) === value;
+}
+
+function compatibilityFlags(value: unknown): string[] | null {
+  if (!Array.isArray(value) || value.length > 64) return null;
+  if (!value.every((flag) => typeof flag === "string" && COMPATIBILITY_FLAG.test(flag))) return null;
+  const flags = value as string[];
+  return new Set(flags).size === flags.length ? [...flags] : null;
+}
+
 /** Strict runtime parser. Unknown Wrangler capabilities fail closed rather than being ignored. */
 export function parseFlueWranglerDescriptor(input: unknown): FlueWranglerDescriptor {
   const top = record(input);
@@ -82,13 +94,12 @@ export function parseFlueWranglerDescriptor(input: unknown): FlueWranglerDescrip
   if (typeof top.main !== "string" || !isSafeModulePath(top.main)) {
     throw new FlueWranglerDescriptorError("flue_wrangler.main must be a safe relative .js/.mjs module path");
   }
-  if (top.compatibility_date !== FLUE_COMPATIBILITY_DATE) {
-    throw new FlueWranglerDescriptorError(`flue_wrangler.compatibility_date must be ${FLUE_COMPATIBILITY_DATE}`);
+  if (!isCompatibilityDate(top.compatibility_date)) {
+    throw new FlueWranglerDescriptorError("flue_wrangler.compatibility_date must be a valid YYYY-MM-DD date");
   }
-  if (!Array.isArray(top.compatibility_flags)
-    || top.compatibility_flags.length !== 1
-    || top.compatibility_flags[0] !== FLUE_COMPATIBILITY_FLAGS[0]) {
-    throw new FlueWranglerDescriptorError("flue_wrangler.compatibility_flags must be exactly [\"nodejs_compat\"]");
+  const parsedCompatibilityFlags = compatibilityFlags(top.compatibility_flags);
+  if (!parsedCompatibilityFlags) {
+    throw new FlueWranglerDescriptorError("flue_wrangler.compatibility_flags must be a unique array of valid flag names");
   }
   if (top.no_bundle !== true) {
     throw new FlueWranglerDescriptorError("flue_wrangler.no_bundle must be true");
@@ -121,16 +132,14 @@ export function parseFlueWranglerDescriptor(input: unknown): FlueWranglerDescrip
     bindings.push({ name: binding.name, class_name: binding.class_name });
   }
 
-  const registries = bindings.filter((binding) =>
-    binding.name === "FLUE_REGISTRY" && binding.class_name === "FlueRegistry");
-  if (registries.length !== 1) {
-    throw new FlueWranglerDescriptorError("flue_wrangler must bind FLUE_REGISTRY to FlueRegistry exactly once");
+  if (bindings.length === 0) {
+    throw new FlueWranglerDescriptorError("flue_wrangler must contain at least one same-script durable-object binding");
   }
 
   return {
     main: top.main,
-    compatibility_date: FLUE_COMPATIBILITY_DATE,
-    compatibility_flags: ["nodejs_compat"],
+    compatibility_date: top.compatibility_date,
+    compatibility_flags: parsedCompatibilityFlags,
     no_bundle: true,
     durable_objects: { bindings },
   };
@@ -172,8 +181,8 @@ export function composeWrangler(
   return {
     config: {
       main: parsed.main,
-      compatibility_date: FLUE_COMPATIBILITY_DATE,
-      compatibility_flags: ["nodejs_compat"],
+      compatibility_date: parsed.compatibility_date,
+      compatibility_flags: parsed.compatibility_flags,
       durable_objects: { bindings: parsed.durable_objects.bindings },
       migrations: ledger,
       vars: { ...(oc.extraVars ?? {}), OC_GATEWAY: oc.gatewayUrl },

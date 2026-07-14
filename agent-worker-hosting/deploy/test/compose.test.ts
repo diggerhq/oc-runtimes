@@ -43,22 +43,32 @@ describe("parseFlueWranglerDescriptor", () => {
         { name: "FLUE_REGISTRY", class_name: "FlueRegistry" },
       ] },
     }],
-    ["wrong compatibility date", { ...descriptor(["a"]), compatibility_date: "2026-07-01" }],
-    ["extra compatibility flag", { ...descriptor(["a"]), compatibility_flags: ["nodejs_compat", "unsafe"] }],
+    ["invalid compatibility date", { ...descriptor(["a"]), compatibility_date: "2026-02-30" }],
+    ["invalid compatibility flag", { ...descriptor(["a"]), compatibility_flags: ["nodejs_compat", "unsafe flag"] }],
+    ["duplicate compatibility flag", { ...descriptor(["a"]), compatibility_flags: ["nodejs_compat", "nodejs_compat"] }],
     ["bundling enabled", { ...descriptor(["a"]), no_bundle: false }],
     ["unsafe main", { ...descriptor(["a"]), main: "../index.js" }],
   ])("rejects %s", (_name, input) => {
     expect(() => parseFlueWranglerDescriptor(input)).toThrow(FlueWranglerDescriptorError);
   });
 
-  it("requires unique non-empty bindings and the exact registry binding", () => {
+  it("requires unique bindings and at least one Durable Object", () => {
     const duplicate = descriptor(["a"]);
     duplicate.durable_objects.bindings.push({ name: "FLUE_A_AGENT", class_name: "OtherAgent" });
     expect(() => parseFlueWranglerDescriptor(duplicate)).toThrow(/unique/);
 
-    const missingRegistry = descriptor(["a"]);
-    missingRegistry.durable_objects.bindings.pop();
-    expect(() => parseFlueWranglerDescriptor(missingRegistry)).toThrow(/FLUE_REGISTRY/);
+    const noBindings = descriptor([]);
+    noBindings.durable_objects.bindings = [];
+    expect(() => parseFlueWranglerDescriptor(noBindings)).toThrow(/at least one/);
+  });
+
+  it("preserves valid build-profile changes instead of pinning Flue internals", () => {
+    const changed = descriptor(["a"]);
+    changed.compatibility_date = "2026-07-01";
+    changed.compatibility_flags = ["nodejs_compat", "nodejs_als"];
+    changed.durable_objects.bindings.at(-1)!.name = "FLUE_STATE";
+    changed.durable_objects.bindings.at(-1)!.class_name = "FlueState";
+    expect(parseFlueWranglerDescriptor(changed)).toEqual(changed);
   });
 });
 
