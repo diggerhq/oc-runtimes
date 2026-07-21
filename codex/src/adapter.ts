@@ -7,7 +7,8 @@
 // gate, so the old user.message-only filter silently ATE deliveries (review finding) —
 // a rendered notification any model can act on beats a consumed-and-lost wakeup.
 
-import { runAdapter, standardInputFilter, standardRenderInput, type TranslateCtx, type DurableEmitter } from "@oc/adapter-core";
+import { runAdapter, standardInputFilter, standardRenderInput } from "@oc/adapter-core";
+import { createCodexTranslator } from "./translate.js";
 
 runAdapter({
   name: "codex",
@@ -20,10 +21,5 @@ runAdapter({
   mcpTools: ["bash", "read", "write", "ls", "say", "ask"],
 
   // Native Codex SDK step → OC taxonomy. Tool events come from the MCP host, not here.
-  async translate(emitter: DurableEmitter, msg: any, ctx: TranslateCtx): Promise<void> {
-    if (msg?.type === "item.completed" && msg.item?.type === "agent_message" && msg.item.text?.trim()) {
-      ctx.noteAssistantText(msg.item.text);
-      await emitter.emit({ type: "agent.message", level: "progress", body: { text: msg.item.text } });
-    }
-  },
+  translate: createCodexTranslator(),
 });

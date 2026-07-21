@@ -8,8 +8,8 @@
 
 import {
   runAdapter, standardInputFilter, standardRenderInput,
-  type TranslateCtx, type DurableEmitter,
 } from "@oc/adapter-core";
+import { createClaudeTranslator } from "./translate.js";
 
 runAdapter({
   name: "claude",
@@ -40,27 +40,5 @@ runAdapter({
 
   // Native Claude Agent SDK step → OC taxonomy. tool_use blocks (incl. say/ask) emit their
   // own events from the MCP host, not here.
-  async translate(emitter: DurableEmitter, msg: any, ctx: TranslateCtx): Promise<void> {
-    if (msg?.type === "assistant") {
-      for (const block of msg.message?.content ?? []) {
-        if (block.type === "text" && block.text?.trim()) {
-          ctx.noteAssistantText(block.text);
-          await emitter.emit({ type: "agent.message", level: "progress", body: { text: block.text } });
-        }
-      }
-    } else if (msg?.type === "result") {
-      const u = msg.usage ?? {};
-      await emitter.emit({
-        type: "agent.result", level: "internal",
-        body: {
-          subtype: msg.subtype, num_turns: msg.num_turns, model: ctx.model.replace(/^anthropic\//, ""), is_error: msg.is_error,
-          duration_ms: msg.duration_ms, duration_api_ms: msg.duration_api_ms, total_cost_usd: msg.total_cost_usd,
-          usage: {
-            input_tokens: u.input_tokens, output_tokens: u.output_tokens,
-            cache_creation_input_tokens: u.cache_creation_input_tokens, cache_read_input_tokens: u.cache_read_input_tokens,
-          },
-        },
-      });
-    }
-  },
+  translate: createClaudeTranslator(),
 });

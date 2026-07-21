@@ -59,8 +59,10 @@ the adapter aborts the request; the brain must abort its SDK run.
 is seven knobs: `defaultModel`, `isInputForModel`, `renderInput`, `translate` (native
 step → OC events), `sourcesNote`, `skillsDir`, `mcpTools`. Use the exported
 `standardInputFilter`/`standardRenderInput` unless you have a reason: they pass user
-messages + rendered `github.*` watch deliveries, and a filter that drops watch input
-silently eats deliveries (the watches API has no per-runtime gate).
+messages + rendered `github.*` watch deliveries + canonical `http.request` payloads, and
+a filter that drops machine input silently eats deliveries (neither surface has a
+per-runtime gate). Claude, Codex, and Pi emit one normalized final `agent.result` usage
+observation; missing or invalid provider usage stays explicitly unreported.
 
 ## Dev
 

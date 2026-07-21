@@ -4,8 +4,9 @@
 // (the host's OC_SKILLS_DIR carries the claude layout — ignored here), and pi's native
 // AgentSessionEvent translation (message_end + the server's synthetic result step).
 
-import { runAdapter, standardInputFilter, standardRenderInput, type TranslateCtx, type DurableEmitter } from "@oc/adapter-core";
+import { runAdapter, standardInputFilter, standardRenderInput } from "@oc/adapter-core";
 import { join } from "node:path";
+import { createPiTranslator } from "./translate.js";
 
 runAdapter({
   name: "pi",
@@ -37,28 +38,5 @@ runAdapter({
   // Native pi session event → OC taxonomy. The brain streams pi's AgentSessionEvents
   // verbatim plus ONE synthetic {kind:"result"} aggregated before the done line. Assistant
   // text becomes agent.message@progress (say/ask/tool events come from the MCP host).
-  async translate(emitter: DurableEmitter, msg: any, ctx: TranslateCtx): Promise<void> {
-    if (msg?.type === "message_end" && msg.message?.role === "assistant") {
-      const content = Array.isArray(msg.message.content) ? msg.message.content : [];
-      for (const block of content) {
-        if (block?.type === "text" && block.text?.trim()) {
-          ctx.noteAssistantText(block.text);
-          await emitter.emit({ type: "agent.message", level: "progress", body: { text: block.text } });
-        }
-      }
-    } else if (msg?.type === "result") {
-      const u = msg.usage ?? {};
-      await emitter.emit({
-        type: "agent.result", level: "internal",
-        body: {
-          num_steps: msg.num_steps, model: ctx.model, is_error: Boolean(msg.is_error),
-          duration_ms: msg.duration_ms,
-          usage: {
-            input_tokens: u.input, output_tokens: u.output,
-            cache_creation_input_tokens: u.cacheWrite, cache_read_input_tokens: u.cacheRead,
-          },
-        },
-      });
-    }
-  },
+  translate: createPiTranslator(),
 });

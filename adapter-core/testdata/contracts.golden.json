@@ -1,0 +1,33 @@
+{
+  "http_object": "[HTTP invocation]\n\n{\"event_url\":\"https://sentry.example/events/123\",\"nested\":{\"a\":1,\"z\":2},\"source\":\"sentry\",\"tags\":[\"payments\",null]}",
+  "http_scalar": "[HTTP invocation]\n\n42",
+  "http_fallback": "[HTTP invocation]\n\nnull",
+  "claude_usage": {
+    "reported": true,
+    "input_tokens": 100,
+    "output_tokens": 20,
+    "cache_creation_input_tokens": 7,
+    "cache_read_input_tokens": 5,
+    "tokens": 132,
+    "total_cost_usd": 0.0123
+  },
+  "codex_usage": {
+    "reported": true,
+    "input_tokens": 70,
+    "output_tokens": 20,
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 30,
+    "tokens": 120
+  },
+  "pi_usage": {
+    "reported": true,
+    "input_tokens": 11,
+    "output_tokens": 13,
+    "cache_creation_input_tokens": 17,
+    "cache_read_input_tokens": 19,
+    "tokens": 60
+  },
+  "unreported": {
+    "reported": false
+  }
+}
