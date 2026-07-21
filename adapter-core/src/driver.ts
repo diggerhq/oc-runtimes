@@ -97,13 +97,39 @@ export function canonicalJson(value: unknown): string {
   }
 }
 
-/** Deterministic model rendering for the neutral `http.request` event (design 016 §3.3). */
+function hookDisplayName(e: InEvent): string | null {
+  const actor = e.actor !== null && typeof e.actor === "object" && !Array.isArray(e.actor)
+    ? e.actor as Record<string, unknown>
+    : null;
+  const refs = e.refs !== null && typeof e.refs === "object" && !Array.isArray(e.refs)
+    ? e.refs as Record<string, unknown>
+    : null;
+  const http = refs?.http !== null && typeof refs?.http === "object" && !Array.isArray(refs.http)
+    ? refs.http as Record<string, unknown>
+    : null;
+  const hookId = http?.hook_id;
+  return typeof hookId === "string"
+    && /^hk_[0-9a-f]{24}$/.test(hookId)
+    && actor?.id === hookId
+    && actor.type === "trigger"
+    && typeof actor.display === "string"
+    && /^[a-z0-9][a-z0-9-]{0,63}$/.test(actor.display)
+    ? actor.display
+    : null;
+}
+
+/** Deterministic model rendering for `http.request` events (design 016 §3.3,
+ *  design 017 §7.3). Hook provenance is platform-authored and validated by the
+ *  matching actor/ref identifiers; ordinary Agent URL input stays neutral. */
 export function renderHttpRequest(e: InEvent): string {
   const body = e.body !== null && typeof e.body === "object" && !Array.isArray(e.body)
     ? e.body as Record<string, unknown>
     : null;
   const payload = body && Object.hasOwn(body, "payload") ? body.payload : null;
-  return `[HTTP invocation]\n\n${canonicalJson(payload)}`;
+  const hookName = hookDisplayName(e);
+  return hookName
+    ? `[HTTP hook: ${hookName}]\n\n${payload === null ? "(empty payload)" : canonicalJson(payload)}`
+    : `[HTTP invocation]\n\n${canonicalJson(payload)}`;
 }
 
 /** The standard input filter: human messages + watch/HTTP deliveries. STRICT type allowlist —
