@@ -60,16 +60,128 @@ export function renderWatchEvent(type: string, body: any): string {
   return msg + why;
 }
 
-/** The standard input filter: human messages + watch deliveries. STRICT type allowlist —
+/** Render one JSON value with recursively sorted object keys and compact separators.
+ *  Agent URL/Hook ingress validates this as finite, depth-bounded JSON before persistence;
+ *  the defensive fallback keeps a malformed legacy event from crashing a runtime. */
+export function canonicalJson(value: unknown): string {
+  const ancestors = new Set<object>();
+
+  function render(current: unknown): string {
+    if (current === null) return "null";
+    if (typeof current === "string" || typeof current === "boolean") {
+      return JSON.stringify(current);
+    }
+    if (typeof current === "number") {
+      if (!Number.isFinite(current)) throw new Error("non-finite JSON number");
+      return JSON.stringify(current);
+    }
+    if (typeof current !== "object") throw new Error("non-JSON value");
+    if (ancestors.has(current)) throw new Error("cyclic JSON value");
+
+    ancestors.add(current);
+    try {
+      if (Array.isArray(current)) {
+        return `[${current.map((item) => render(item)).join(",")}]`;
+      }
+      const record = current as Record<string, unknown>;
+      return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${render(record[key])}`).join(",")}}`;
+    } finally {
+      ancestors.delete(current);
+    }
+  }
+
+  try {
+    return render(value);
+  } catch {
+    return "null";
+  }
+}
+
+/** Deterministic model rendering for the neutral `http.request` event (design 016 §3.3). */
+export function renderHttpRequest(e: InEvent): string {
+  const body = e.body !== null && typeof e.body === "object" && !Array.isArray(e.body)
+    ? e.body as Record<string, unknown>
+    : null;
+  const payload = body && Object.hasOwn(body, "payload") ? body.payload : null;
+  return `[HTTP invocation]\n\n${canonicalJson(payload)}`;
+}
+
+/** The standard input filter: human messages + watch/HTTP deliveries. STRICT type allowlist —
  *  `agent.message` (the agent's own answers/asks) is ALSO user-level, so a suffix match
  *  would re-feed the agent its own prior output as next-turn input. */
 export function standardInputFilter(e: InEvent): boolean {
-  return e.level === "user" && typeof e.type === "string" && (e.type === "user.message" || e.type.startsWith("github."));
+  return e.level === "user" && typeof e.type === "string"
+    && (e.type === "user.message" || e.type === "http.request" || e.type.startsWith("github."));
 }
 
-/** The standard input renderer: watch deliveries via renderWatchEvent, else textOf. */
+/** The standard input renderer: HTTP/watch deliveries get their neutral rendering, else textOf. */
 export function standardRenderInput(e: InEvent): string {
+  if (e.type === "http.request") return renderHttpRequest(e);
   return typeof e.type === "string" && e.type.startsWith("github.") ? renderWatchEvent(e.type, e.body) : textOf(e.body);
+}
+
+export interface UsageObservationInput {
+  inputTokens?: unknown;
+  outputTokens?: unknown;
+  cacheCreationInputTokens?: unknown;
+  cacheReadInputTokens?: unknown;
+  totalCostUsd?: unknown;
+  /** OpenAI/Codex reports cached input as a subset of input_tokens. */
+  inputIncludesCacheRead?: boolean;
+}
+
+export type NormalizedUsage =
+  | { reported: false }
+  | {
+      reported: true;
+      input_tokens: number;
+      output_tokens: number;
+      cache_creation_input_tokens: number;
+      cache_read_input_tokens: number;
+      tokens: number;
+      total_cost_usd?: number;
+    };
+
+/** Normalize one runtime invocation's final provider usage into the platform contract.
+ *  Missing components are zero. Any present invalid value makes the whole observation
+ *  unreported so persistence never mistakes malformed provider data for exact usage. */
+export function normalizeUsage(input: UsageObservationInput | null | undefined): NormalizedUsage {
+  if (!input) return { reported: false };
+
+  const integer = (value: unknown): number | null => {
+    if (value === undefined) return 0;
+    return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
+  };
+  const rawInput = integer(input.inputTokens);
+  const output = integer(input.outputTokens);
+  const cacheCreation = integer(input.cacheCreationInputTokens);
+  const cacheRead = integer(input.cacheReadInputTokens);
+  if (rawInput === null || output === null || cacheCreation === null || cacheRead === null) {
+    return { reported: false };
+  }
+
+  const exclusiveInput = input.inputIncludesCacheRead ? rawInput - cacheRead : rawInput;
+  if (!Number.isSafeInteger(exclusiveInput) || exclusiveInput < 0) return { reported: false };
+  const tokens = exclusiveInput + output + cacheCreation + cacheRead;
+  if (!Number.isSafeInteger(tokens)) return { reported: false };
+
+  let totalCostUsd: number | undefined;
+  if (input.totalCostUsd !== undefined) {
+    if (typeof input.totalCostUsd !== "number" || !Number.isFinite(input.totalCostUsd) || input.totalCostUsd < 0) {
+      return { reported: false };
+    }
+    totalCostUsd = input.totalCostUsd;
+  }
+
+  return {
+    reported: true,
+    input_tokens: exclusiveInput,
+    output_tokens: output,
+    cache_creation_input_tokens: cacheCreation,
+    cache_read_input_tokens: cacheRead,
+    tokens,
+    ...(totalCostUsd !== undefined ? { total_cost_usd: totalCostUsd } : {}),
+  };
 }
 
 /** Passed to spec.translate alongside each native step. */

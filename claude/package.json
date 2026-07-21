@@ -1,6 +1,6 @@
 {
   "name": "@oc/runtime-claude",
-  "version": "0.0.23",
+  "version": "0.0.24",
   "private": true,
   "type": "module",
   "description": "Durable Agent Sessions (v3) Claude runtime image: a Claude Agent SDK wrapper conforming to the v3 runtime contract (launch-durable-agent-sessions.md \u00a75.9). Adapted from runtimes/claude: repoints /v2\u2192/v3, drops the `kind` discriminator (top-level `type` only, \u00a74.1), journals under OC_RUNTIME_STATE_DIR (\u00a75.10), relies on the sealed ANTHROPIC_API_KEY + host egress proxy (no plaintext key in the VM, \u00a75.7), and gates deliver/reconcile as coming-soon. Standalone \u2014 its own deps and build, kept out of the root tsc (built via its own toolchain).",
@@ -10,7 +10,8 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/adapter.js",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "npm run build && node test/translate.test.mjs"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.3.177",
