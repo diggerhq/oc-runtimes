@@ -39,4 +39,8 @@ await createPiTranslator()({ emit: async (event) => invalidEvents.push(event) },
 equal(invalidEvents[0]?.body?.is_error, true);
 deepStrictEqual(invalidEvents[0]?.body?.usage, { reported: false });
 
+const adapterSource = readFileSync(new URL("../src/adapter.ts", import.meta.url), "utf8");
+equal(/isInputForModel:\s*standardInputFilter/.test(adapterSource), true);
+equal(/renderInput:\s*standardRenderInput/.test(adapterSource), true);
+
 console.log("pi normalized result golden passed");

@@ -148,6 +148,7 @@ async function runTurn(req: IncomingMessage, res: ServerResponse): Promise<void>
 
     const { events } = await thread.runStreamed(prompt);
     let awaiting = false;
+    let turnFailure: { type: string; message: string } | null = null;
     for await (const event of events) {
       if (ac.signal.aborted) throw new Error("aborted");
       // Stream the NATIVE codex event; the adapter translates + appends durably.
@@ -157,9 +158,16 @@ async function runTurn(req: IncomingMessage, res: ServerResponse): Promise<void>
       // adapter's MCP host is the authoritative needs_input signal — this just sets done.reason.
       const e = event as { type?: string; item?: { type?: string; name?: string; tool?: string } };
       if (e.type === "item.completed" && /(^|[._])ask$/.test(e.item?.tool ?? e.item?.name ?? "")) awaiting = true;
+      if (event.type === "turn.failed") {
+        turnFailure = { type: "turn_failed", message: event.error.message };
+      } else if (event.type === "error") {
+        turnFailure = { type: "turn_failed", message: event.message };
+      }
     }
     if (thread.id) writeFileSync(threadFile, thread.id);   // ★O2b: persist for resume
-    writeLine(res, { kind: "done", reason: awaiting ? "awaiting_input" : "quiescent" });
+    writeLine(res, turnFailure
+      ? { kind: "done", reason: "error", error: turnFailure }
+      : { kind: "done", reason: awaiting ? "awaiting_input" : "quiescent" });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     if (ac.signal.aborted) writeLine(res, { kind: "done", reason: "error", error: { type: "aborted", message } });

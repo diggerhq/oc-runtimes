@@ -5,7 +5,7 @@ import {
   type TranslateCtx,
 } from "@oc/adapter-core";
 
-/** One Codex turn.completed event is the invocation total. Ignore duplicate snapshots. */
+/** One Codex terminal event is the invocation result. Ignore duplicate snapshots. */
 export function createCodexTranslator(): RuntimeSpec["translate"] {
   let resultEmitted = false;
 
@@ -16,8 +16,21 @@ export function createCodexTranslator(): RuntimeSpec["translate"] {
       return;
     }
 
-    if (msg?.type !== "turn.completed" || resultEmitted) return;
+    if ((msg?.type !== "turn.completed" && msg?.type !== "turn.failed") || resultEmitted) return;
     resultEmitted = true;
+    if (msg.type === "turn.failed") {
+      await emitter.emit({
+        type: "agent.result",
+        level: "internal",
+        body: {
+          model: ctx.model,
+          is_error: true,
+          error: typeof msg.error?.message === "string" ? msg.error.message : "Codex turn failed",
+          usage: { reported: false },
+        },
+      });
+      return;
+    }
     const raw = msg.usage;
     const usage = normalizeUsage(raw && typeof raw === "object" && !Array.isArray(raw) ? {
       // Codex/OpenAI's cached input is a subset of input_tokens, not an extra component.

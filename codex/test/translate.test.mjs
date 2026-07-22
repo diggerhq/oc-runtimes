@@ -1,4 +1,4 @@
-import { deepStrictEqual } from "node:assert/strict";
+import { deepStrictEqual, equal } from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
 process.env.OC_API_URL = "http://127.0.0.1:1";
@@ -31,5 +31,27 @@ await translate(emitter, result, ctx);
 
 deepStrictEqual(events, golden);
 deepStrictEqual(notes, ["I inspected the request."]);
+
+const failedEvents = [];
+const failedTranslate = createCodexTranslator();
+await failedTranslate({ emit: async (event) => failedEvents.push(event) }, {
+  type: "turn.failed",
+  error: { message: "provider request failed" },
+}, ctx);
+await failedTranslate({ emit: async (event) => failedEvents.push(event) }, result, ctx);
+deepStrictEqual(failedEvents, [{
+  type: "agent.result",
+  level: "internal",
+  body: {
+    model: "openai/gpt-5-codex",
+    is_error: true,
+    error: "provider request failed",
+    usage: { reported: false },
+  },
+}]);
+
+const adapterSource = readFileSync(new URL("../src/adapter.ts", import.meta.url), "utf8");
+equal(/isInputForModel:\s*standardInputFilter/.test(adapterSource), true);
+equal(/renderInput:\s*standardRenderInput/.test(adapterSource), true);
 
 console.log("codex normalized result golden passed");

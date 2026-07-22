@@ -84,19 +84,20 @@ deepStrictEqual(normalizeUsage({
   cacheCreationInputTokens: 17,
   cacheReadInputTokens: 19,
 }), golden.pi_usage);
-deepStrictEqual(normalizeUsage({}), {
-  reported: true,
-  input_tokens: 0,
-  output_tokens: 0,
-  cache_creation_input_tokens: 0,
-  cache_read_input_tokens: 0,
-  tokens: 0,
-});
+deepStrictEqual(normalizeUsage({}), golden.unreported);
 deepStrictEqual(normalizeUsage(undefined), golden.unreported);
 deepStrictEqual(normalizeUsage({ inputTokens: -1 }), golden.unreported);
 deepStrictEqual(normalizeUsage({ inputTokens: 2, cacheReadInputTokens: 3, inputIncludesCacheRead: true }), golden.unreported);
 deepStrictEqual(normalizeUsage({ outputTokens: Number.NaN }), golden.unreported);
 deepStrictEqual(normalizeUsage({ cacheCreationInputTokens: Number.MAX_SAFE_INTEGER, outputTokens: 1 }), golden.unreported);
 deepStrictEqual(normalizeUsage({ totalCostUsd: Number.POSITIVE_INFINITY }), golden.unreported);
+deepStrictEqual(normalizeUsage({ inputTokens: 4, totalCostUsd: Number.POSITIVE_INFINITY }), {
+  reported: true,
+  input_tokens: 4,
+  output_tokens: 0,
+  cache_creation_input_tokens: 0,
+  cache_read_input_tokens: 0,
+  tokens: 4,
+});
 
 console.log("adapter-core HTTP input and usage contract goldens passed");

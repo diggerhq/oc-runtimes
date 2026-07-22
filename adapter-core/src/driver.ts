@@ -169,10 +169,18 @@ export type NormalizedUsage =
     };
 
 /** Normalize one runtime invocation's final provider usage into the platform contract.
- *  Missing components are zero. Any present invalid value makes the whole observation
- *  unreported so persistence never mistakes malformed provider data for exact usage. */
+ *  At least one token component must be present; the other components default to zero.
+ *  Any present invalid token value makes the whole observation unreported so persistence
+ *  never mistakes malformed provider data for exact usage. Cost is optional visibility:
+ *  malformed cost is omitted without discarding otherwise trustworthy token counts. */
 export function normalizeUsage(input: UsageObservationInput | null | undefined): NormalizedUsage {
   if (!input) return { reported: false };
+  if (
+    input.inputTokens === undefined
+    && input.outputTokens === undefined
+    && input.cacheCreationInputTokens === undefined
+    && input.cacheReadInputTokens === undefined
+  ) return { reported: false };
 
   const integer = (value: unknown): number | null => {
     if (value === undefined) return 0;
@@ -192,10 +200,11 @@ export function normalizeUsage(input: UsageObservationInput | null | undefined):
   if (!Number.isSafeInteger(tokens)) return { reported: false };
 
   let totalCostUsd: number | undefined;
-  if (input.totalCostUsd !== undefined) {
-    if (typeof input.totalCostUsd !== "number" || !Number.isFinite(input.totalCostUsd) || input.totalCostUsd < 0) {
-      return { reported: false };
-    }
+  if (
+    typeof input.totalCostUsd === "number"
+    && Number.isFinite(input.totalCostUsd)
+    && input.totalCostUsd >= 0
+  ) {
     totalCostUsd = input.totalCostUsd;
   }
 

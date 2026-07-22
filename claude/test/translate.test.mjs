@@ -49,4 +49,21 @@ equal(errorEvents[0]?.body?.is_error, true);
 equal(errorEvents[0]?.body?.usage?.reported, true);
 equal(errorEvents[0]?.body?.usage?.tokens, 5);
 
+const invalidCostEvents = [];
+await createClaudeTranslator()({ emit: async (event) => invalidCostEvents.push(event) }, {
+  type: "result",
+  subtype: "success",
+  is_error: false,
+  total_cost_usd: Number.POSITIVE_INFINITY,
+  usage: { input_tokens: 3, output_tokens: 2 },
+}, ctx);
+equal(invalidCostEvents[0]?.body?.usage?.reported, true);
+equal(invalidCostEvents[0]?.body?.usage?.tokens, 5);
+equal("total_cost_usd" in invalidCostEvents[0].body.usage, false);
+equal("total_cost_usd" in invalidCostEvents[0].body, false);
+
+const adapterSource = readFileSync(new URL("../src/adapter.ts", import.meta.url), "utf8");
+equal(/isInputForModel:\s*standardInputFilter/.test(adapterSource), true);
+equal(/renderInput:\s*standardRenderInput/.test(adapterSource), true);
+
 console.log("claude normalized result golden passed");
