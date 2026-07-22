@@ -1,0 +1,27 @@
+[
+  {
+    "type": "agent.message",
+    "level": "progress",
+    "body": {
+      "text": "I inspected the request."
+    }
+  },
+  {
+    "type": "agent.result",
+    "level": "internal",
+    "body": {
+      "num_steps": 3,
+      "model": "anthropic/claude-opus-4-8",
+      "is_error": false,
+      "duration_ms": 900,
+      "usage": {
+        "reported": true,
+        "input_tokens": 11,
+        "output_tokens": 13,
+        "cache_creation_input_tokens": 17,
+        "cache_read_input_tokens": 19,
+        "tokens": 60
+      }
+    }
+  }
+]
