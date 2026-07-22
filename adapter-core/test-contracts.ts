@@ -38,6 +38,20 @@ equal(standardRenderInput(httpObject), golden.http_object);
 equal(standardRenderInput(event("http.request", { payload: 42 })), golden.http_scalar);
 equal(standardRenderInput(event("http.request", {})), golden.http_fallback);
 
+const hookEvent = event("http.request", { payload: { status: "firing", service: "checkout" } });
+hookEvent.actor = { id: "hk_a4c92e8f17b64d03a9510c7e", type: "trigger", display: "grafana-prod" };
+hookEvent.refs = {
+  http: {
+    request_id: "req_89b711af7bc94b61b893aa10",
+    hook_id: "hk_a4c92e8f17b64d03a9510c7e",
+  },
+};
+equal(standardRenderInput(hookEvent), golden.http_hook);
+hookEvent.body = { payload: null };
+equal(standardRenderInput(hookEvent), golden.http_hook_empty);
+hookEvent.actor = { ...hookEvent.actor as Record<string, unknown>, id: "hk_000000000000000000000000" };
+equal(standardRenderInput(hookEvent), golden.http_fallback);
+
 equal(standardInputFilter(event("user.message", { text: "hello" })), true);
 equal(standardInputFilter(event("github.pr.comment", {})), true);
 equal(standardInputFilter(event("agent.message", { text: "do not replay me" })), false);
