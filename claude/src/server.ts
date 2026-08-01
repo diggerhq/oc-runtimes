@@ -115,6 +115,16 @@ async function runTurn(req: IncomingMessage, res: ServerResponse): Promise<void>
   }
   childEnv.CLAUDE_CODE_MAX_RETRIES = process.env.CLAUDE_CODE_MAX_RETRIES ?? "2";
   childEnv.API_TIMEOUT_MS = process.env.API_TIMEOUT_MS ?? "120000";
+  // Keep Claude Code's OWN state (conversation transcripts under projects/,
+  // settings, todos) INSIDE the checkpointed state dir. Without this it lives in
+  // ~/.claude on the box: `continue:` looks up the transcript for our cwd there,
+  // the host's boundary checkpoint never captures it, and a recreated brain
+  // resumes with total amnesia while restore reports success (observed live
+  // 2026-08-01: every checkpoint ~2.5KB — a journal-less skeleton). The
+  // cwd-local `.claude/skills` (OC_SKILLS_DIR) is project-scoped and unaffected.
+  const claudeConfigDir = join(stateDir, "claude-home");
+  mkdirSync(claudeConfigDir, { recursive: true });
+  childEnv.CLAUDE_CONFIG_DIR = claudeConfigDir;
 
   // Tools come from an EXTERNAL MCP server the adapter hosts (decoupling: the brain
   // never calls OC's sandbox API). HTTP transport (R7). The SDK supports external MCP
